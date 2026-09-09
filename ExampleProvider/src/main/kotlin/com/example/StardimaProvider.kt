@@ -17,7 +17,8 @@ class StardimaProvider : MainAPI() {
         "$mainUrl/category/cartoons/" to "Cartoons"
     )
 
-    override suspend fun getMainPage(page: Int, request: MainPageData): HomePageResponse {
+    // Updated signature: MainPageRequest instead of MainPageData, and HomePageResponse? return type
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         val document = app.get(request.data).document
         val homeItems = document.select("article, .item-video, .video-card").mapNotNull {
             it.toSearchResult()
