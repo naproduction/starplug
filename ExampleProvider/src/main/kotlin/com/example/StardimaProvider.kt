@@ -3,23 +3,22 @@ package com.example
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 
 class StardimaProvider : MainAPI() {
-    // The active DooPlay streaming directory for Stardima
     override var mainUrl = "https://watch.stardima.com/watch"
     override var name = "ستارديما (Stardima)"
     override val hasMainPage = true
     override var lang = "ar"
     override val supportedTypes = setOf(TvType.Cartoon, TvType.Anime, TvType.Movie)
 
-    // Standard desktop User-Agent to ensure DooPlay serves full HTML
     private val headers = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Referer" to "$mainUrl/"
     )
 
-    // 1. Home Page Sections (Shows, Episodes, and Cartoon Movies)
+    // 1. Home Page Sections
     override val mainPage = mainPageOf(
         "$mainUrl/tvshows/" to "المسلسلات الكرتونية (Cartoons)",
         "$mainUrl/episodes/" to "أحدث الحلقات (Latest Episodes)",
@@ -30,7 +29,6 @@ class StardimaProvider : MainAPI() {
         val url = if (page <= 1) request.data else "${request.data.removeSuffix("/")}/page/$page/"
         val document = app.get(url, headers = headers).document
 
-        // DooPlay theme card selectors
         val items = document.select(".items article, article.item, .animation-2").mapNotNull {
             it.toSearchResult()
         }
@@ -42,7 +40,6 @@ class StardimaProvider : MainAPI() {
         val linkEl = this.selectFirst(".data h3 a, h3 a, a") ?: return null
         val href = fixUrlNull(linkEl.attr("href")) ?: return null
         
-        // Extract title from either text or image alt attribute
         val title = linkEl.text().ifEmpty { 
             this.selectFirst(".poster img, img")?.attr("alt") ?: "كرتون" 
         }.trim()
@@ -58,7 +55,7 @@ class StardimaProvider : MainAPI() {
         }
     }
 
-    // 2. Search Engine
+    // 2. Search
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/?s=${encodeUrl(query)}"
         val document = app.get(url, headers = headers).document
@@ -68,7 +65,7 @@ class StardimaProvider : MainAPI() {
         }
     }
 
-    // 3. Load Show Details & Season/Episode Lists
+    // 3. Load Details, Episode Lists & Backdrop Banners
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url, headers = headers).document
 
@@ -78,11 +75,14 @@ class StardimaProvider : MainAPI() {
                 ?: document.selectFirst(".poster img")?.attr("src")
                 ?: document.selectFirst("meta[property=og:image]")?.attr("content")
         )
+        // Extract wide backdrop banner for TV
+        val banner = fixUrlNull(
+            document.selectFirst(".sbackdrop img, .backdrop img")?.attr("src")
+                ?: document.selectFirst("meta[property=og:image]")?.attr("content")
+        )
         val description = document.selectFirst(".wp-content p, #info .wp-content, .entry-content p")?.text()
 
         val episodes = ArrayList<Episode>()
-
-        // Check if page contains DooPlay seasons/episodes list
         val episodeElements = document.select("#seasons .episodios li, ul.episodios li")
 
         if (episodeElements.isNotEmpty()) {
@@ -92,7 +92,6 @@ class StardimaProvider : MainAPI() {
                 val epNumText = el.selectFirst(".numerando")?.text() ?: ""
                 val epTitle = el.selectFirst(".episodiocss a, a")?.text() ?: epNumText
 
-                // Parse episode numbers like "1 - 5" -> season 1, episode 5
                 val seasonNum = epNumText.substringBefore("-").trim().toIntOrNull()
                 val episodeNum = epNumText.substringAfter("-").trim().toIntOrNull()
 
@@ -117,17 +116,19 @@ class StardimaProvider : MainAPI() {
         return if (url.contains("/movies/")) {
             newMovieLoadResponse(title, url, TvType.Movie, url) {
                 this.posterUrl = poster
+                this.backgroundPosterUrl = banner
                 this.plot = description
             }
         } else {
             newTvSeriesLoadResponse(title, url, TvType.Cartoon, episodes) {
                 this.posterUrl = poster
+                this.backgroundPosterUrl = banner
                 this.plot = description
             }
         }
     }
 
-    // 4. Resolve Third-party Embedded Players
+    // 4. Resolve Servers and Player Options via DooPlay AJAX
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -136,18 +137,104 @@ class StardimaProvider : MainAPI() {
     ): Boolean {
         val document = app.get(data, headers = headers).document
 
-        // Collect all iframes (Dood, Streamtape, Ok.ru, Vidmoly, etc.)
-        val iframes = document.select("iframe, .playex iframe, #dooplay_player_response iframe")
+        // Check for DooPlay server options (Server 1, Server 2, etc.)
+        val playerOptions = document.select("ul#playeroptionsul li, .dooplay_player_option, #playeroptions li")
+
+        val ajaxHeaders = headers + mapOf(
+            "X-Requested-With" to "XMLHttpRequest",
+            "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8"
+        )
+        val ajaxUrl = "$mainUrl/wp-admin/admin-ajax.php"
+
+        for (option in playerOptions) {
+            val postId = option.attr("data-post").ifEmpty { null }
+            val nume = option.attr("data-nume").ifEmpty { null }
+            val type = option.attr("data-type").ifEmpty { "tv" }
+
+            if (postId != null && nume != null) {
+                try {
+                    // Send AJAX request for this specific server option
+                    var response = app.post(
+                        ajaxUrl,
+                        headers = ajaxHeaders,
+                        data = mapOf(
+                            "action" to "doo_player_ajax",
+                            "post" to postId,
+                            "nume" to nume,
+                            "type" to type
+                        )
+                    ).text
+
+                    // Fallback to dt_player_ajax if doo_player_ajax returned empty or 0
+                    if (response.isBlank() || response == "0") {
+                        response = app.post(
+                            ajaxUrl,
+                            headers = ajaxHeaders,
+                            data = mapOf(
+                                "action" to "dt_player_ajax",
+                                "post" to postId,
+                                "nume" to nume,
+                                "type" to type
+                            )
+                        ).text
+                    }
+
+                    val embedUrl = extractEmbedUrl(response)
+                    if (!embedUrl.isNullOrBlank()) {
+                        loadExtractor(embedUrl, data, subtitleCallback, callback)
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            }
+        }
+
+        // Check for any direct/static iframes on the page
+        val staticIframes = document.select("iframe, .playex iframe, #dooplay_player_response iframe")
             .mapNotNull { it.attr("src").ifEmpty { it.attr("data-src") } }
 
-        for (rawUrl in iframes) {
+        for (rawUrl in staticIframes) {
             val iframeUrl = fixUrl(rawUrl)
             if (iframeUrl.startsWith("http")) {
                 loadExtractor(iframeUrl, data, subtitleCallback, callback)
             }
         }
 
+        // Check download / external server link buttons
+        val externalLinks = document.select(".links a, .download-links a, a.btn-download, #download a")
+        for (a in externalLinks) {
+            val href = a.attr("href")
+            if (href.startsWith("http") && !href.contains(mainUrl)) {
+                loadExtractor(href, data, subtitleCallback, callback)
+            }
+        }
+
         return true
+    }
+
+    private fun extractEmbedUrl(response: String): String? {
+        // 1. Check if the response contains an HTML iframe
+        val doc = Jsoup.parse(response)
+        val iframeSrc = doc.selectFirst("iframe")?.attr("src")
+        if (!iframeSrc.isNullOrBlank()) {
+            return fixUrl(iframeSrc)
+        }
+
+        // 2. Check if JSON response: {"embed_url": "https://..."}
+        val jsonRegex = Regex("""["']embed_url["']\s*:\s*["']([^"']+)["']""")
+        val match = jsonRegex.find(response)
+        if (match != null) {
+            return fixUrl(match.groupValues[1].replace("\\/", "/"))
+        }
+
+        // 3. Fallback: search for any URL inside src="..."
+        val srcRegex = Regex("""src=["'](https?://[^"']+)["']""")
+        val srcMatch = srcRegex.find(response)
+        if (srcMatch != null) {
+            return fixUrl(srcMatch.groupValues[1].replace("\\/", "/"))
+        }
+
+        return null
     }
 
     private fun encodeUrl(str: String): String {
