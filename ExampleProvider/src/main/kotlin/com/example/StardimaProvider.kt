@@ -2,6 +2,8 @@ package com.example
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
@@ -65,7 +67,7 @@ class StardimaProvider : MainAPI() {
         }
     }
 
-    // 3. Load Show / Movie Details & Episodes
+    // 3. Load Details & Episode Lists
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url, headers = headers).document
 
@@ -126,7 +128,7 @@ class StardimaProvider : MainAPI() {
         }
     }
 
-    // 4. Resolve Gateway Links, Watch Pages, and External Video Hosts
+    // 4. Resolve Stardima Servers & Video Files
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -136,7 +138,7 @@ class StardimaProvider : MainAPI() {
         val document = app.get(data, headers = headers).document
         val targetUrls = LinkedHashSet<String>()
 
-        // A. Extract "انقر هنا للإنتقال لصفحة المشاهدة" / "السيرفر" / "مشاهدة" buttons
+        // Grab watch buttons & server links: "انقر هنا للإنتقال لصفحة المشاهدة", "السيرفر 1", etc.
         document.select("a").forEach { a ->
             val text = a.text()
             val href = a.attr("href").trim()
@@ -150,7 +152,7 @@ class StardimaProvider : MainAPI() {
             }
         }
 
-        // B. Extract Links from Download & Mirror Tables
+        // Grab links from download & mirror tables
         document.select("table a, .links a, .download-links a, a[href*='/links/']").forEach { a ->
             val href = a.attr("href").trim()
             if (href.isNotEmpty() && !href.startsWith("#") && !href.startsWith("javascript:")) {
@@ -158,32 +160,13 @@ class StardimaProvider : MainAPI() {
             }
         }
 
-        // C. Check for direct iframes on the current page
+        // Grab direct iframes on current page
         document.select("iframe, .playex iframe, #dooplay_player_response iframe").forEach { iframe ->
             val src = iframe.attr("src").ifEmpty { iframe.attr("data-src") }
             if (src.isNotBlank()) targetUrls.add(fixUrl(src))
         }
 
-        // D. Also check DooPlay AJAX options if configured
-        val playerOptions = document.select("ul#playeroptionsul li, .dooplay_player_option, #playeroptions li")
-        val ajaxUrl = "$mainUrl/wp-admin/admin-ajax.php"
-        for (opt in playerOptions) {
-            val postId = opt.attr("data-post").ifEmpty { null }
-            val nume = opt.attr("data-nume").ifEmpty { null }
-            val type = opt.attr("data-type").ifEmpty { "tv" }
-            if (postId != null && nume != null) {
-                try {
-                    val res = app.post(
-                        ajaxUrl,
-                        headers = headers + mapOf("X-Requested-With" to "XMLHttpRequest"),
-                        data = mapOf("action" to "doo_player_ajax", "post" to postId, "nume" to nume, "type" to type)
-                    ).text
-                    extractEmbedUrl(res)?.let { targetUrls.add(it) }
-                } catch (_: Exception) {}
-            }
-        }
-
-        // E. Crawl into each found link (resolving gateways & extractors)
+        // Resolve each discovered target URL
         for (rawUrl in targetUrls) {
             resolveAndExtract(rawUrl, data, subtitleCallback, callback)
         }
@@ -200,28 +183,77 @@ class StardimaProvider : MainAPI() {
         val fixed = fixUrl(targetUrl)
         if (!fixed.startsWith("http")) return
 
-        // 1. If it's directly an external host (Streamtape, Doodstream, Vidmoly, Ok.ru, Mega, etc.)
+        // --- SCENARIO 1: Stardima's Private Embed Server (old.stardima.com) ---
+        if (fixed.contains("old.stardima.com") || fixed.contains("embed.php")) {
+            try {
+                val embedDoc = app.get(fixed, headers = headers).document
+                val html = embedDoc.html()
+
+                // A. Check for direct HTML5 video source tags
+                val videoSrc = embedDoc.select("video source, video").attr("src")
+                if (videoSrc.isNotBlank()) {
+                    val fullVideoUrl = fixUrl(videoSrc)
+                    callback(
+                        ExtractorLink(
+                            source = this.name,
+                            name = "ستارديما (سيرفر مباشر)",
+                            url = fullVideoUrl,
+                            referer = fixed,
+                            quality = Qualities.P720.value,
+                            type = if (fullVideoUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        )
+                    )
+                    return
+                }
+
+                // B. Check for video links in JavaScript (file: "https://...mp4")
+                val jsRegex = Regex("""(?:file|src|source)\s*:\s*["'](https?://[^"']+\.(?:mp4|m3u8)[^"']*)["']""")
+                val match = jsRegex.find(html)
+                if (match != null) {
+                    val streamUrl = match.groupValues[1].replace("\\/", "/")
+                    callback(
+                        ExtractorLink(
+                            source = this.name,
+                            name = "ستارديما (HD)",
+                            url = streamUrl,
+                            referer = fixed,
+                            quality = Qualities.P720.value,
+                            type = if (streamUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        )
+                    )
+                    return
+                }
+
+                // C. Check if old.stardima embeds standard players (Ok.ru, Dailymotion, YouTube)
+                val subIframes = embedDoc.select("iframe").mapNotNull { it.attr("src") }
+                for (subIframe in subIframes) {
+                    loadExtractor(fixUrl(subIframe), fixed, subtitleCallback, callback)
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+            return
+        }
+
+        // --- SCENARIO 2: External Video Hosts (Ok.ru, Streamtape, Dood, etc.) ---
         if (!fixed.contains("stardima.com") && !fixed.contains("stardima.app")) {
             loadExtractor(fixed, referer, subtitleCallback, callback)
             return
         }
 
-        // 2. If it's an internal Stardima gateway/watch page, fetch it to find the real player
+        // --- SCENARIO 3: Intermediate Stardima Watch/Link Gateways ---
         try {
             val subDoc = app.get(fixed, headers = headers).document
 
-            // Check for iframes inside the gateway page
+            // If the gateway contains an iframe (e.g. pointing to old.stardima.com/embed.php)
             val iframes = subDoc.select("iframe").mapNotNull { 
                 it.attr("src").ifEmpty { it.attr("data-src") } 
             }
             for (iframe in iframes) {
-                val fixedIframe = fixUrl(iframe)
-                if (fixedIframe.startsWith("http") && !fixedIframe.contains("stardima.com")) {
-                    loadExtractor(fixedIframe, fixed, subtitleCallback, callback)
-                }
+                resolveAndExtract(fixUrl(iframe), fixed, subtitleCallback, callback)
             }
 
-            // Check for external download/redirect buttons (e.g. "تحميل الرابط")
+            // If the gateway contains external redirect buttons (like "تحميل الرابط")
             subDoc.select("a[href]").forEach { a ->
                 val href = fixUrl(a.attr("href"))
                 if (href.startsWith("http") && !href.contains("stardima.com") && !href.contains("stardima.app")) {
@@ -231,22 +263,6 @@ class StardimaProvider : MainAPI() {
         } catch (e: Exception) {
             e.printStackTrace()
         }
-    }
-
-    private fun extractEmbedUrl(response: String): String? {
-        val doc = Jsoup.parse(response)
-        val iframeSrc = doc.selectFirst("iframe")?.attr("src")
-        if (!iframeSrc.isNullOrBlank()) return fixUrl(iframeSrc)
-
-        val jsonRegex = Regex("""["']embed_url["']\s*:\s*["']([^"']+)["']""")
-        val match = jsonRegex.find(response)
-        if (match != null) return fixUrl(match.groupValues[1].replace("\\/", "/"))
-
-        val srcRegex = Regex("""src=["'](https?://[^"']+)["']""")
-        val srcMatch = srcRegex.find(response)
-        if (srcMatch != null) return fixUrl(srcMatch.groupValues[1].replace("\\/", "/"))
-
-        return null
     }
 
     private fun encodeUrl(str: String): String {
