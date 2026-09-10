@@ -1,6 +1,7 @@
 package com.example
 
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
@@ -20,6 +21,9 @@ class StardimaProvider : MainAPI() {
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Referer" to "$mainUrl/"
     )
+
+    // Cloudflare bypass interceptor
+    private val cfInterceptor = CloudflareKiller()
 
     // 1. Home Page Sections
     override val mainPage = mainPageOf(
@@ -43,6 +47,7 @@ class StardimaProvider : MainAPI() {
             if (title.isBlank() || title.contains("تسجيل الدخول")) return@mapNotNull null
 
             val poster = fixUrlNull(img.attr("src").ifEmpty { img.attr("data-src") })
+
             val isMovie = href.contains("/movie/")
             val type = if (isMovie) TvType.Movie else TvType.Cartoon
 
@@ -70,6 +75,7 @@ class StardimaProvider : MainAPI() {
             if (title.isBlank() || title.contains("تسجيل الدخول")) return@mapNotNull null
 
             val poster = fixUrlNull(img.attr("src").ifEmpty { img.attr("data-src") })
+
             val isMovie = href.contains("/movie/")
             val type = if (isMovie) TvType.Movie else TvType.Cartoon
 
@@ -79,11 +85,10 @@ class StardimaProvider : MainAPI() {
         }.distinctBy { it.url }
     }
 
-    // 3. Load Details & Full Episode List (Cleaned of login modal text)
+    // 3. Load Details & Full Episode List
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url, headers = headers).document
 
-        // Clean title: removes login modal headers
         val title = document.selectFirst("meta[property='og:title']")?.attr("content")
             ?.substringBefore("-")?.replace("مشاهدة وتحميل", "")?.replace("مسلسل", "")?.replace("كرتون", "")?.trim()
             ?: document.select("h1").map { it.text().trim() }.firstOrNull { !it.contains("تسجيل") && it.isNotBlank() }
@@ -94,7 +99,6 @@ class StardimaProvider : MainAPI() {
                 ?: document.selectFirst("meta[property=og:image]")?.attr("content")
         )
 
-        // Clean plot: filters out login modals, One2Auth, and Google account strings
         val description = document.selectFirst("meta[property='og:description']")?.attr("content")
             ?.takeIf { !it.contains("تسجيل الدخول") && !it.contains("One2Auth") && it.isNotBlank() }
             ?: document.select("p").map { it.text().trim() }.firstOrNull { 
@@ -103,7 +107,6 @@ class StardimaProvider : MainAPI() {
 
         val episodes = ArrayList<Episode>()
 
-        // Fetch play page to extract all 25+ episodes if show page only displays 1 button
         val playBtn = document.select("a[href*='/play/']").firstOrNull()?.attr("href")
         val targetDoc = if (playBtn != null && !url.contains("/play/")) {
             try { app.get(fixUrl(playBtn), headers = headers).document } catch (_: Exception) { document }
@@ -131,7 +134,6 @@ class StardimaProvider : MainAPI() {
             }
         }
 
-        // Fallback from Inertia data-page if HTML tags are sparse
         if (episodes.isEmpty()) {
             val dataPage = targetDoc.selectFirst("#app, [data-page]")?.attr("data-page")
             if (!dataPage.isNullOrBlank()) {
@@ -184,7 +186,7 @@ class StardimaProvider : MainAPI() {
         }
     }
 
-    // 4. Resolve All 7 Servers Directly (No fake debug URLs, zero hang)
+    // 4. Resolve Links Using Cloudflare Killer
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -197,7 +199,7 @@ class StardimaProvider : MainAPI() {
 
         var foundAny = false
 
-        // A. Extract Hyperwatching Video ID (handles escaped slashes)
+        // A. Extract Hyperwatching Video ID (e.g. 6YQBcQR8DT1z)
         val videoPattern = Regex("""hyperwatching\.com(?:\\?/|/)(?:watch|embed)(?:\\?/|/)([a-zA-Z0-9]+)""")
         var videoId = videoPattern.find(rawHtml)?.groupValues?.get(1)
             ?: videoPattern.find(cleanHtml)?.groupValues?.get(1)
@@ -211,17 +213,17 @@ class StardimaProvider : MainAPI() {
             }
         }
 
-        // B. Query Hyperwatching endpoints across server ID range
+        // B. Query Hyperwatching with Cloudflare Killer Bypass
         if (!videoId.isNullOrBlank()) {
             val serverIds = LinkedHashSet<String>()
-            
-            // Extract server IDs from page if present
+
+            // Extract server IDs from page
             val idPattern = Regex("""(?:&quot;|")id(?:&quot;|")\s*:\s*(\d{5,8})""")
             for (m in idPattern.findAll(cleanHtml)) {
                 serverIds.add(m.groupValues[1])
             }
 
-            // Fallback: Query adjacent server IDs around the confirmed base ID
+            // Probe adjacent server IDs around the confirmed base ID
             if (serverIds.isEmpty()) {
                 val baseId = 861929
                 for (offset in -4..5) {
@@ -239,7 +241,9 @@ class StardimaProvider : MainAPI() {
             for (sId in serverIds) {
                 try {
                     val apiUrl = "https://v2.hyperwatching.com/embed/$videoId/server/$sId/url"
-                    val res = app.get(apiUrl, headers = apiHeaders).text
+                    
+                    // CloudflareKiller intercepts 403, harvests cf_clearance, and retries with 200 OK
+                    val res = app.get(apiUrl, headers = apiHeaders, interceptor = cfInterceptor).text
 
                     if (res.contains("\"status\"") && res.contains("\"ok\"")) {
                         processServerJson(res, data, subtitleCallback, callback)
@@ -249,7 +253,7 @@ class StardimaProvider : MainAPI() {
             }
         }
 
-        // C. Direct Video Hosts in the HTML (Uqload, Mixdrop, Streamhg, etc.)
+        // C. Direct Host Regex Fallback (Uqload, Mixdrop, Streamhg, etc.)
         val hostRegex = Regex("""https?:\\?/\\?/[^"'\s<>]*(?:uqload|mixdrop|streamhg|goodstream|savefiles|earnvids|strema\.top)[^"'\s<>]*""")
         for (match in hostRegex.findAll(rawHtml)) {
             val hostUrl = match.value.replace("\\/", "/")
@@ -322,7 +326,7 @@ class StardimaProvider : MainAPI() {
             }
         }
 
-        // 3. Direct download link
+        // 3. Fallback direct download link
         val downloadUrl = json.optString("download_url")
         if (downloadUrl.startsWith("http") && !downloadUrl.contains("hyperwatching")) {
             callback(
