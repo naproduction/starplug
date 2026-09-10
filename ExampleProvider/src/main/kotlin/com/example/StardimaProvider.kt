@@ -20,7 +20,6 @@ class StardimaProvider : MainAPI() {
         "Referer" to "$mainUrl/"
     )
 
-    // 1. Home Page Sections
     override val mainPage = mainPageOf(
         "$mainUrl/tvshows/" to "المسلسلات الكرتونية (Cartoons)",
         "$mainUrl/episodes/" to "أحدث الحلقات (Latest Episodes)",
@@ -57,7 +56,6 @@ class StardimaProvider : MainAPI() {
         }
     }
 
-    // 2. Search
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/?s=${encodeUrl(query)}"
         val document = app.get(url, headers = headers).document
@@ -67,7 +65,6 @@ class StardimaProvider : MainAPI() {
         }
     }
 
-    // 3. Load Details & Episode Lists
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url, headers = headers).document
 
@@ -128,7 +125,7 @@ class StardimaProvider : MainAPI() {
         }
     }
 
-    // 4. Resolve All Stardima Plyr Streams, Gateways & Video Hosts
+    // 4. Extract Server Selection Dialog & Video Hosts
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -136,145 +133,99 @@ class StardimaProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val document = app.get(data, headers = headers).document
-        val targetUrls = LinkedHashSet<String>()
 
-        // 1. Direct iframes on the episode page
-        document.select("iframe, .playex iframe, #dooplay_player_response iframe").forEach { iframe ->
-            val src = iframe.attr("src").ifEmpty { iframe.attr("data-src") }
-            if (src.isNotBlank()) targetUrls.add(fixUrl(src))
+        // Collect all links pointing to servers or watch pages
+        val serverCandidates = LinkedHashMap<String, String>() // URL -> Server Name
+
+        // A. Capture the Server List from Screenshot 2 (Uqload, Lulustream, Mixdrop, Goodstream, etc.)
+        document.select(".server-item, .server, li[data-url], li[data-src], .player-servers a, a[data-url], a[data-src], table a, .links a").forEach { el ->
+            val name = el.selectFirst(".title, h4, span, p")?.text()?.ifEmpty { el.text() } ?: "سيرفر"
+            val rawUrl = el.attr("data-url").ifEmpty {
+                el.attr("data-src").ifEmpty {
+                    el.attr("href")
+                }
+            }.trim()
+
+            if (rawUrl.isNotEmpty() && !rawUrl.startsWith("#") && !rawUrl.startsWith("javascript:")) {
+                serverCandidates[fixUrl(rawUrl)] = name
+            }
         }
 
-        // 2. Watch page buttons: "انقر هنا للإنتقال لصفحة المشاهدة", "مشاهدة اونلاين. السيرفر X"
+        // B. Capture Watch Page Buttons
         document.select("a").forEach { a ->
             val text = a.text()
             val href = a.attr("href").trim()
             if (href.isNotEmpty() && !href.startsWith("#") && !href.startsWith("javascript:")) {
-                if (text.contains("صفحة المشاهدة") || 
-                    text.contains("مشاهدة") || 
-                    text.contains("السيرفر") || 
-                    text.contains("سيرفر")) {
-                    targetUrls.add(fixUrl(href))
+                if (text.contains("صفحة المشاهدة") || text.contains("مشاهدة") || text.contains("السيرفر")) {
+                    serverCandidates[fixUrl(href)] = text.trim()
                 }
             }
         }
 
-        // 3. Download & mirror links table
-        document.select("table a, .links a, .download-links a, a[href*='/links/']").forEach { a ->
-            val href = a.attr("href").trim()
-            if (href.isNotEmpty() && !href.startsWith("#") && !href.startsWith("javascript:")) {
-                targetUrls.add(fixUrl(href))
+        // C. Capture direct iframes
+        document.select("iframe").forEach { iframe ->
+            val src = iframe.attr("src").ifEmpty { iframe.attr("data-src") }
+            if (src.isNotBlank()) {
+                serverCandidates[fixUrl(src)] = "سيرفر رئيسي"
             }
         }
 
-        // 4. DooPlay AJAX options
-        val playerOptions = document.select("ul#playeroptionsul li, .dooplay_player_option, #playeroptions li")
-        val ajaxUrl = "$mainUrl/wp-admin/admin-ajax.php"
-        for (opt in playerOptions) {
-            val postId = opt.attr("data-post").ifEmpty { null }
-            val nume = opt.attr("data-nume").ifEmpty { null }
-            val type = opt.attr("data-type").ifEmpty { "tv" }
-            if (postId != null && nume != null) {
-                try {
-                    val res = app.post(
-                        ajaxUrl,
-                        headers = headers + mapOf("X-Requested-With" to "XMLHttpRequest"),
-                        data = mapOf("action" to "doo_player_ajax", "post" to postId, "nume" to nume, "type" to type)
-                    ).text
-                    extractEmbedUrl(res)?.let { targetUrls.add(it) }
-                } catch (_: Exception) {}
-            }
-        }
-
-        // Resolve every candidate URL found
-        for (rawUrl in targetUrls) {
-            extractAllStreams(rawUrl, data, subtitleCallback, callback, 0)
+        // Process each discovered server
+        for ((targetUrl, serverName) in serverCandidates) {
+            resolveServerLink(targetUrl, serverName, data, subtitleCallback, callback)
         }
 
         return true
     }
 
-    private suspend fun extractAllStreams(
-        targetUrl: String,
+    private suspend fun resolveServerLink(
+        url: String,
+        serverName: String,
         referer: String,
         subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit,
-        depth: Int
+        callback: (ExtractorLink) -> Unit
     ) {
-        if (depth > 2) return
-        val fixedUrl = fixUrl(targetUrl)
+        val fixedUrl = fixUrl(url)
         if (!fixedUrl.startsWith("http")) return
 
-        // If it's a standard third-party video host (Ok.ru, Streamtape, Doodstream, etc.)
-        if (isKnownExternalHost(fixedUrl)) {
+        // 1. Try standard CloudStream extractor first
+        if (isKnownHost(fixedUrl)) {
             loadExtractor(fixedUrl, referer, subtitleCallback, callback)
-            return
         }
 
+        // 2. Resolve JWPlayer / Packed JS / Custom Hosts (e.g. strema.top, lulustream, uqload)
         try {
             val response = app.get(fixedUrl, headers = headers + mapOf("Referer" to referer))
-            val doc = response.document
             val html = response.text
+            val doc = response.document
 
-            // A. EXTRACT DIRECT PLYR HTML5 <video> & <source> TAGS (Stardima player.php)
-            val videoSources = doc.select("video source, source[src], video[src]")
-            for (source in videoSources) {
-                val src = source.attr("src").trim()
-                val qualityLabel = source.attr("size").ifEmpty { source.attr("res") }
-                val quality = qualityLabel.toIntOrNull() ?: Qualities.P720.value
+            // Check if page contains packed JS (Dean Edwards eval(function(p,a,c,k,e,d)...))
+            val unpacked = unpackJs(html)
+            val fullContent = "$html\n$unpacked"
 
-                if (src.startsWith("http")) {
-                    callback(
-                        ExtractorLink(
-                            source = this.name,
-                            name = "ستارديما (${if (qualityLabel.isNotEmpty()) "${qualityLabel}p" else "سيرفر رئيسي"})",
-                            url = src,
-                            referer = fixedUrl,
-                            quality = quality,
-                            type = if (src.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                        )
-                    )
-                }
-            }
-
-            // B. EXTRACT PLYR JS SOURCES & GOOGLE CDN PLAYBACK LINKS
-            val jsSourcesRegex = Regex("""["']?(?:file|src|url)["']?\s*:\s*["'](https?://[^"']+)["']""")
-            for (match in jsSourcesRegex.findAll(html)) {
+            // Look for master.m3u8, direct .mp4, or JWPlayer sources
+            val streamRegex = Regex("""["']?(?:file|src|url)["']?\s*:\s*["'](https?://[^"']+\.(?:m3u8|mp4)[^"']*)["']""")
+            for (match in streamRegex.findAll(fullContent)) {
                 val streamUrl = match.groupValues[1].replace("\\/", "/")
-                if (isValidVideoStream(streamUrl)) {
-                    callback(
-                        ExtractorLink(
-                            source = this.name,
-                            name = "ستارديما (HD)",
-                            url = streamUrl,
-                            referer = fixedUrl,
-                            quality = Qualities.P720.value,
-                            type = if (streamUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                        )
+                val isHls = streamUrl.contains(".m3u8")
+
+                callback(
+                    ExtractorLink(
+                        source = this.name,
+                        name = serverName.ifEmpty { "ستارديما" },
+                        url = streamUrl,
+                        referer = fixedUrl,
+                        quality = Qualities.P720.value,
+                        type = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                     )
-                }
+                )
             }
 
-            // C. Crawl nested iframes (e.g. embed players, player.php)
-            val iframes = doc.select("iframe").mapNotNull { 
-                it.attr("src").ifEmpty { it.attr("data-src") } 
-            }
-            for (iframe in iframes) {
-                val fixedIframe = fixUrl(iframe)
-                if (fixedIframe.startsWith("http") && fixedIframe != fixedUrl) {
-                    extractAllStreams(fixedIframe, fixedUrl, subtitleCallback, callback, depth + 1)
-                }
-            }
-
-            // D. Crawl link/download redirect buttons (e.g. "تحميل الرابط")
-            val candidateLinks = doc.select("a[href]").mapNotNull { it.attr("href") }
-            for (cLink in candidateLinks) {
-                val fixedLink = fixUrl(cLink)
-                if (fixedLink.startsWith("http") && fixedLink != fixedUrl) {
-                    if (isKnownExternalHost(fixedLink)) {
-                        loadExtractor(fixedLink, fixedUrl, subtitleCallback, callback)
-                    } else if (fixedLink.contains("/links/") || fixedLink.contains("player.php")) {
-                        extractAllStreams(fixedLink, fixedUrl, subtitleCallback, callback, depth + 1)
-                    }
+            // Look for nested iframes on gateway pages
+            doc.select("iframe").forEach { iframe ->
+                val nestedSrc = iframe.attr("src").ifEmpty { iframe.attr("data-src") }
+                if (nestedSrc.isNotBlank() && nestedSrc != fixedUrl) {
+                    loadExtractor(fixUrl(nestedSrc), fixedUrl, subtitleCallback, callback)
                 }
             }
         } catch (e: Exception) {
@@ -282,47 +233,42 @@ class StardimaProvider : MainAPI() {
         }
     }
 
-    private fun isKnownExternalHost(url: String): Boolean {
+    private fun isKnownHost(url: String): Boolean {
         val lower = url.lowercase()
-        return lower.contains("ok.ru") || 
+        return lower.contains("uqload") || 
+               lower.contains("mixdrop") || 
                lower.contains("streamtape") || 
                lower.contains("dood") || 
                lower.contains("vidmoly") || 
-               lower.contains("dailymotion") || 
-               lower.contains("youtube") || 
-               lower.contains("mp4upload") || 
-               lower.contains("filemoon") || 
-               lower.contains("uqload")
+               lower.contains("lulustream") || 
+               lower.contains("luluvdo") || 
+               lower.contains("ok.ru")
     }
 
-    private fun isValidVideoStream(url: String): Boolean {
-        val lower = url.lowercase()
-        if (lower.contains(".jpg") || lower.contains(".png") || lower.contains(".webp") || 
-            lower.contains(".css") || lower.contains(".js") || lower.contains(".vtt") || 
-            lower.contains("google-analytics") || lower.contains("googletagmanager")) {
-            return false
+    // De-obfuscator for Dean Edwards eval(function(p,a,c,k,e,d)...) JS packers
+    private fun unpackJs(script: String): String {
+        return try {
+            val packerPattern = Regex("""eval\(function\(p,a,c,k,e,d\)\{.*?\}\('(.*?)',(\d+),(\d+),'(.*?)'\.split\('\|'\)""")
+            val match = packerPattern.find(script) ?: return ""
+
+            val payload = match.groupValues[1]
+            val radix = match.groupValues[2].toInt()
+            val count = match.groupValues[3].toInt()
+            val symTab = match.groupValues[4].split("|")
+
+            fun lookup(word: String): String {
+                val idx = if (radix <= 36) {
+                    word.toIntOrNull(radix) ?: -1
+                } else {
+                    -1
+                }
+                return if (idx in 0 until symTab.size && symTab[idx].isNotEmpty()) symTab[idx] else word
+            }
+
+            Regex("""\b\w+\b""").replace(payload) { m -> lookup(m.value) }
+        } catch (e: Exception) {
+            ""
         }
-        return lower.contains(".mp4") || 
-               lower.contains(".m3u8") || 
-               lower.contains("googleusercontent.com") || 
-               lower.contains("videoplayback") || 
-               lower.contains("video.google")
-    }
-
-    private fun extractEmbedUrl(response: String): String? {
-        val doc = Jsoup.parse(response)
-        val iframeSrc = doc.selectFirst("iframe")?.attr("src")
-        if (!iframeSrc.isNullOrBlank()) return fixUrl(iframeSrc)
-
-        val jsonRegex = Regex("""["']embed_url["']\s*:\s*["']([^"']+)["']""")
-        val match = jsonRegex.find(response)
-        if (match != null) return fixUrl(match.groupValues[1].replace("\\/", "/"))
-
-        val srcRegex = Regex("""src=["'](https?://[^"']+)["']""")
-        val srcMatch = srcRegex.find(response)
-        if (srcMatch != null) return fixUrl(srcMatch.groupValues[1].replace("\\/", "/"))
-
-        return null
     }
 
     private fun encodeUrl(str: String): String {
