@@ -10,8 +10,7 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 
 class StardimaProvider : MainAPI() {
-    // Restored to the working server-rendered catalog domain
-    override var mainUrl = "https://watch.stardima.com/watch"
+    override var mainUrl = "https://www.stardima.com"
     override var name = "ستارديما (Stardima)"
     override val hasMainPage = true
     override var lang = "ar"
@@ -22,87 +21,91 @@ class StardimaProvider : MainAPI() {
         "Referer" to "$mainUrl/"
     )
 
-    // 1. Home Page Sections (Populates all cartoons & anime)
+    // 1. Home Page Sections (Populates all categories)
     override val mainPage = mainPageOf(
-        "$mainUrl/tvshows/" to "المسلسلات الكرتونية (Cartoons)",
-        "$mainUrl/episodes/" to "أحدث الحلقات (Latest Episodes)",
-        "$mainUrl/movies/" to "أفلام كرتون (Movies)"
+        "$mainUrl" to "الرئيسية (Home)",
+        "$mainUrl/newrelases" to "المضاف حديثا (Latest)",
+        "$mainUrl/mosalsalat" to "مسلسلات (Series)",
+        "$mainUrl/aflam" to "أفلام (Movies)"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
-        val url = if (page <= 1) request.data else "${request.data.removeSuffix("/")}/page/$page/"
-        val document = app.get(url, headers = headers).document
+        val document = app.get(request.data, headers = headers).document
 
-        val items = document.select(".items article, article.item, .animation-2").mapNotNull {
-            it.toSearchResult()
-        }
+        // Target every cartoon poster card on Stardima
+        val items = document.select("img[alt*='Poster'], img[alt*='بوستر']").mapNotNull { img ->
+            val parentLink = img.parents().select("a[href]").firstOrNull() ?: img.closest("a")
+            val href = fixUrlNull(parentLink?.attr("href")) ?: return@mapNotNull null
+            if (!href.contains("/tvshow/") && !href.contains("/movie/")) return@mapNotNull null
+            if (href.contains("/play/")) return@mapNotNull null // Skip individual episode links
 
-        return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
+            val rawTitle = img.attr("alt")
+            val title = rawTitle.replace("Poster for ", "").replace("Poster for", "").trim()
+            if (title.isBlank()) return@mapNotNull null
+
+            val poster = fixUrlNull(img.attr("src").ifEmpty { img.attr("data-src") })
+
+            val isMovie = href.contains("/movie/")
+            val type = if (isMovie) TvType.Movie else TvType.Cartoon
+
+            newAnimeSearchResponse(title, href, type) {
+                this.posterUrl = poster
+            }
+        }.distinctBy { it.url }
+
+        return newHomePageResponse(request.name, items, hasNext = false)
     }
 
-    private fun Element.toSearchResult(): SearchResponse? {
-        val linkEl = this.selectFirst(".data h3 a, h3 a, a") ?: return null
-        val href = fixUrlNull(linkEl.attr("href")) ?: return null
-        
-        val title = linkEl.text().ifEmpty { 
-            this.selectFirst(".poster img, img")?.attr("alt") ?: "كرتون" 
-        }.trim()
-
-        val img = this.selectFirst(".poster img, img")
-        val poster = fixUrlNull(img?.attr("data-src")?.ifEmpty { null } ?: img?.attr("src"))
-
-        val isMovie = href.contains("/movies/")
-        val type = if (isMovie) TvType.Movie else TvType.Cartoon
-
-        return newAnimeSearchResponse(title, href, type) {
-            this.posterUrl = poster
-        }
-    }
-
-    // 2. Search
+    // 2. Search Engine
     override suspend fun search(query: String): List<SearchResponse> {
-        val url = "$mainUrl/?s=${encodeUrl(query)}"
+        val url = "$mainUrl/search?q=${encodeUrl(query)}"
         val document = app.get(url, headers = headers).document
 
-        return document.select(".result-item, .items article, article.item").mapNotNull {
-            it.toSearchResult()
-        }
+        return document.select("img[alt*='Poster'], img[alt*='بوستر']").mapNotNull { img ->
+            val parentLink = img.parents().select("a[href]").firstOrNull() ?: img.closest("a")
+            val href = fixUrlNull(parentLink?.attr("href")) ?: return@mapNotNull null
+            if (!href.contains("/tvshow/") && !href.contains("/movie/")) return@mapNotNull null
+            if (href.contains("/play/")) return@mapNotNull null
+
+            val rawTitle = img.attr("alt")
+            val title = rawTitle.replace("Poster for ", "").replace("Poster for", "").trim()
+            val poster = fixUrlNull(img.attr("src").ifEmpty { img.attr("data-src") })
+
+            val isMovie = href.contains("/movie/")
+            val type = if (isMovie) TvType.Movie else TvType.Cartoon
+
+            newAnimeSearchResponse(title, href, type) {
+                this.posterUrl = poster
+            }
+        }.distinctBy { it.url }
     }
 
-    // 3. Load Details & Episode Lists
+    // 3. Load Show Details & Full Episode List
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url, headers = headers).document
 
-        val title = (document.selectFirst(".data h1, h1.entry-title, h1")?.text() ?: "Cartoon").trim()
+        val title = document.selectFirst("h1")?.text()?.trim() 
+            ?: document.selectFirst("meta[property=og:title]")?.attr("content")?.substringBefore("-")?.trim()
+            ?: "Cartoon"
+
         val poster = fixUrlNull(
-            document.selectFirst(".poster img")?.attr("data-src")
-                ?: document.selectFirst(".poster img")?.attr("src")
+            document.selectFirst("img[src*='/posters/'], img[src*='image.tmdb.org']")?.attr("src")
                 ?: document.selectFirst("meta[property=og:image]")?.attr("content")
         )
-        val banner = fixUrlNull(
-            document.selectFirst(".sbackdrop img, .backdrop img")?.attr("src")
-                ?: document.selectFirst("meta[property=og:image]")?.attr("content")
-        )
-        val description = document.selectFirst(".wp-content p, #info .wp-content, .entry-content p")?.text()
+        val description = document.select("p").map { it.text().trim() }.firstOrNull { it.length > 30 }
 
         val episodes = ArrayList<Episode>()
-        val episodeElements = document.select("#seasons .episodios li, ul.episodios li, a[href*='/play/']")
 
-        if (episodeElements.isNotEmpty()) {
-            for ((index, el) in episodeElements.withIndex()) {
-                val linkEl = el.selectFirst(".episodiocss a, a") ?: if (el.tagName() == "a") el else continue
-                val epHref = fixUrl(linkEl.attr("href"))
-                val epNumText = el.selectFirst(".numerando")?.text() ?: ""
-                val epTitle = linkEl.text().ifEmpty { epNumText }.ifEmpty { "Episode ${index + 1}" }
-
-                val seasonNum = epNumText.substringBefore("-").trim().toIntOrNull()
-                val episodeNum = epNumText.substringAfter("-").trim().toIntOrNull() ?: (index + 1)
-
+        // Extract all episode play links: /tvshow/.../play/...
+        val epElements = document.select("a[href*='/play/']")
+        if (epElements.isNotEmpty()) {
+            for ((index, el) in epElements.distinctBy { it.attr("href") }.withIndex()) {
+                val epHref = fixUrl(el.attr("href"))
+                val epName = el.text().trim().ifEmpty { "الحلقة ${index + 1}" }
                 episodes.add(
                     newEpisode(epHref) {
-                        this.name = epTitle
-                        this.season = seasonNum
-                        this.episode = episodeNum
+                        this.name = epName
+                        this.episode = index + 1
                     }
                 )
             }
@@ -115,22 +118,21 @@ class StardimaProvider : MainAPI() {
             )
         }
 
-        return if (url.contains("/movies/")) {
+        val isMovie = url.contains("/movie/")
+        return if (isMovie) {
             newMovieLoadResponse(title, url, TvType.Movie, url) {
                 this.posterUrl = poster
-                this.backgroundPosterUrl = banner
                 this.plot = description
             }
         } else {
             newTvSeriesLoadResponse(title, url, TvType.Cartoon, episodes) {
                 this.posterUrl = poster
-                this.backgroundPosterUrl = banner
                 this.plot = description
             }
         }
     }
 
-    // 4. Universal Video Stream Resolver (Instant, no 30-sec hang)
+    // 4. Resolve Hyperwatching Video ID from the Episode Page
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -140,25 +142,25 @@ class StardimaProvider : MainAPI() {
         val document = app.get(data, headers = headers).document
         val fullHtml = document.html()
 
-        // --- A. Check for Hyperwatching (v2.hyperwatching.com) ---
+        // Extract the Hyperwatching video ID (e.g. 6YQBcQR8DT1z)
         var videoId = Regex("""hyperwatching\.com/(?:watch|embed)/([a-zA-Z0-9]+)""").find(fullHtml)?.groupValues?.get(1)
             ?: Regex("""hyperwatching\.com/(?:watch|embed)/([a-zA-Z0-9]+)""").find(data)?.groupValues?.get(1)
 
         if (videoId == null) {
-            for (iframe in document.select("iframe, .playex iframe")) {
+            for (iframe in document.select("iframe")) {
                 val src = iframe.attr("src").ifEmpty { iframe.attr("data-src") }
-                if (src.contains("hyperwatching.com")) {
-                    videoId = Regex("""hyperwatching\.com/(?:watch|embed)/([a-zA-Z0-9]+)""").find(src)?.groupValues?.get(1)
-                    if (videoId != null) break
-                }
+                videoId = Regex("""hyperwatching\.com/(?:watch|embed)/([a-zA-Z0-9]+)""").find(src)?.groupValues?.get(1)
+                if (videoId != null) break
             }
         }
 
-        if (videoId != null) {
-            fetchHyperwatchingServers(videoId, subtitleCallback, callback)
+        // 1. Resolve Hyperwatching servers if videoId is found
+        if (!videoId.isNullOrBlank()) {
+            fetchHyperwatchingServers(videoId, data, subtitleCallback, callback)
+            return true
         }
 
-        // --- B. Extract Direct HTML5 Plyr <video> & <source> tags ---
+        // 2. Direct HTML5 / Plyr <video> & <source> tags fallback
         val videoSources = document.select("video source, source[src], video[src]")
         for (source in videoSources) {
             val src = source.attr("src").trim()
@@ -178,89 +180,37 @@ class StardimaProvider : MainAPI() {
             }
         }
 
-        // --- C. Extract JavaScript Plyr / Direct Video URLs ---
-        val jsSourcesRegex = Regex("""["']?(?:file|src|url)["']?\s*:\s*["'](https?://[^"']+)["']""")
-        for (match in jsSourcesRegex.findAll(fullHtml)) {
-            val streamUrl = match.groupValues[1].replace("\\/", "/")
-            if (isValidVideoStream(streamUrl)) {
-                callback(
-                    ExtractorLink(
-                        source = name,
-                        name = "ستارديما (سيرفر رئيسي)",
-                        url = streamUrl,
-                        referer = data,
-                        quality = Qualities.P720.value,
-                        type = if (streamUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                    )
-                )
-            }
-        }
-
-        // --- D. Resolve Third-Party Iframes (Ok.ru, Streamtape, Uqload, etc.) ---
-        document.select("iframe, .playex iframe, #dooplay_player_response iframe").forEach { iframe ->
+        // 3. Direct iframes fallback
+        document.select("iframe").forEach { iframe ->
             val src = fixUrl(iframe.attr("src").ifEmpty { iframe.attr("data-src") })
             if (src.startsWith("http") && !src.contains("hyperwatching.com")) {
                 loadExtractor(src, data, subtitleCallback, callback)
             }
         }
 
-        // --- E. Extract Download / Mirror Server Table ---
-        document.select("table a, .links a, .download-links a, a[href*='/links/']").forEach { a ->
-            val href = fixUrl(a.attr("href"))
-            val label = a.text().trim()
-            if (href.startsWith("http") && !href.contains(mainUrl)) {
-                loadExtractor(href, data, subtitleCallback, callback)
-            }
-        }
-
-        // --- F. DooPlay Player AJAX Options ---
-        val playerOptions = document.select("ul#playeroptionsul li, .dooplay_player_option, #playeroptions li")
-        val ajaxUrl = "$mainUrl/wp-admin/admin-ajax.php"
-        for (opt in playerOptions) {
-            val post = opt.attr("data-post")
-            val nume = opt.attr("data-nume")
-            val type = opt.attr("data-type").ifEmpty { "tv" }
-            if (post.isNotEmpty() && nume.isNotEmpty()) {
-                try {
-                    val ajaxRes = app.post(
-                        ajaxUrl,
-                        headers = headers + mapOf("X-Requested-With" to "XMLHttpRequest"),
-                        data = mapOf("action" to "doo_player_ajax", "post" to post, "nume" to nume, "type" to type)
-                    ).text
-                    val iframeSrc = Jsoup.parse(ajaxRes).selectFirst("iframe")?.attr("src")
-                    if (!iframeSrc.isNullOrBlank()) {
-                        val fixedSrc = fixUrl(iframeSrc)
-                        if (fixedSrc.contains("hyperwatching.com")) {
-                            val vId = Regex("""hyperwatching\.com/(?:watch|embed)/([a-zA-Z0-9]+)""").find(fixedSrc)?.groupValues?.get(1)
-                            if (vId != null) fetchHyperwatchingServers(vId, subtitleCallback, callback)
-                        } else {
-                            loadExtractor(fixedSrc, data, subtitleCallback, callback)
-                        }
-                    }
-                } catch (_: Exception) {}
-            }
-        }
-
         return true
     }
 
-    // 5. Query /embed/{id}/server/{serverId}/url for Hyperwatching servers
+    // 5. Query /embed/{id}/server/{serverId}/url for all servers
     private suspend fun fetchHyperwatchingServers(
         videoId: String,
+        episodePageUrl: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
         val watchUrl = "https://v2.hyperwatching.com/watch/$videoId"
-        val serverList = ArrayList<Pair<String, String>>()
+        val serverList = ArrayList<Pair<String, String>>() // Pair(serverId, serverName)
 
         try {
             val watchHeaders = mapOf(
                 "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                "Referer" to "$mainUrl/",
+                "Referer" to episodePageUrl,
                 "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
             )
 
             val pageHtml = app.get(watchUrl, headers = watchHeaders).text
+
+            // A. Read server IDs from Inertia <div id="app" data-page="...">
             val doc = Jsoup.parse(pageHtml)
             val dataPage = doc.selectFirst("#app, [data-page]")?.attr("data-page")
 
@@ -281,16 +231,23 @@ class StardimaProvider : MainAPI() {
                 }
             }
 
+            // B. Regex fallback for server IDs
             if (serverList.isEmpty()) {
-                val regex = Regex("""["']id["']\s*:\s*(\d+)\s*,\s*["']name["']\s*:\s*["']([^"']+)["']""")
-                for (match in regex.findAll(pageHtml)) {
+                val regex1 = Regex("""["']id["']\s*:\s*(\d+)\s*,\s*["']name["']\s*:\s*["']([^"']+)["']""")
+                val regex2 = Regex("""["']name["']\s*:\s*["']([^"']+)["']\s*,\s*["']id["']\s*:\s*(\d+)""")
+
+                for (match in regex1.findAll(pageHtml)) {
                     serverList.add(Pair(match.groupValues[1], match.groupValues[2]))
+                }
+                for (match in regex2.findAll(pageHtml)) {
+                    serverList.add(Pair(match.groupValues[2], match.groupValues[1]))
                 }
             }
         } catch (e: Exception) {
             e.printStackTrace()
         }
 
+        // C. Call /embed/{videoId}/server/{serverId}/url for each server
         val apiHeaders = mapOf(
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             "Referer" to watchUrl,
@@ -347,7 +304,7 @@ class StardimaProvider : MainAPI() {
             }
         }
 
-        // 2. Embed URL (strema.top, Uqload, Mixdrop)
+        // 2. Embed URL (strema.top, Uqload, Mixdrop, etc.)
         val embedUrl = json.optString("embed_url")
         if (embedUrl.isNotEmpty()) {
             if (!loadExtractor(embedUrl, referer, subtitleCallback, callback)) {
@@ -405,20 +362,6 @@ class StardimaProvider : MainAPI() {
         } catch (e: Exception) {
             ""
         }
-    }
-
-    private fun isValidVideoStream(url: String): Boolean {
-        val lower = url.lowercase()
-        if (lower.contains(".jpg") || lower.contains(".png") || lower.contains(".webp") || 
-            lower.contains(".css") || lower.contains(".js") || lower.contains(".vtt") || 
-            lower.contains("google-analytics") || lower.contains("googletagmanager")) {
-            return false
-        }
-        return lower.contains(".mp4") || 
-               lower.contains(".m3u8") || 
-               lower.contains("googleusercontent.com") || 
-               lower.contains("videoplayback") || 
-               lower.contains("video.google")
     }
 
     private fun encodeUrl(str: String): String {
