@@ -1,6 +1,8 @@
 package com.example
 
+import android.webkit.CookieManager
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
@@ -43,6 +45,7 @@ class StardimaProvider : MainAPI() {
             if (title.isBlank() || title.contains("تسجيل الدخول")) return@mapNotNull null
 
             val poster = fixUrlNull(img.attr("src").ifEmpty { img.attr("data-src") })
+
             val isMovie = href.contains("/movie/")
             val type = if (isMovie) TvType.Movie else TvType.Cartoon
 
@@ -54,7 +57,7 @@ class StardimaProvider : MainAPI() {
         return newHomePageResponse(request.name, items, hasNext = false)
     }
 
-    // 2. Search
+    // 2. Search Engine
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/search?q=${encodeUrl(query)}"
         val document = app.get(url, headers = headers).document
@@ -70,6 +73,7 @@ class StardimaProvider : MainAPI() {
             if (title.isBlank() || title.contains("تسجيل الدخول")) return@mapNotNull null
 
             val poster = fixUrlNull(img.attr("src").ifEmpty { img.attr("data-src") })
+
             val isMovie = href.contains("/movie/")
             val type = if (isMovie) TvType.Movie else TvType.Cartoon
 
@@ -79,13 +83,15 @@ class StardimaProvider : MainAPI() {
         }.distinctBy { it.url }
     }
 
-    // 3. Load Details & Full Episode List
+    // 3. Load Details & Full Episode List (Cleaned of all login text)
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url, headers = headers).document
 
-        val title = document.selectFirst("h1")?.text()?.trim() 
-            ?: document.selectFirst("meta[property=og:title]")?.attr("content")?.substringBefore("-")?.trim()
-            ?: "Cartoon"
+        // Clean title (never grabs the hidden login modal title)
+        val title = document.selectFirst("meta[property='og:title']")?.attr("content")
+            ?.substringBefore("-")?.replace("مشاهدة وتحميل", "")?.replace("مسلسل", "")?.replace("كرتون", "")?.trim()
+            ?: document.select("h1").map { it.text().trim() }.firstOrNull { !it.contains("تسجيل") && it.isNotBlank() }
+            ?: "كرتون"
 
         val poster = fixUrlNull(
             document.selectFirst("img[src*='/posters/'], img[src*='image.tmdb.org']")?.attr("src")
@@ -99,8 +105,18 @@ class StardimaProvider : MainAPI() {
 
         val episodes = ArrayList<Episode>()
 
-        // A. Extract all episodes from Inertia JSON
-        val dataPage = document.selectFirst("#app, [data-page]")?.attr("data-page")
+        // A. If the show page only has a "تشغيل" button, fetch the play page to read all 25+ episodes
+        val playBtn = document.select("a[href*='/play/']").firstOrNull()?.attr("href")
+        val targetDoc = if (playBtn != null && !url.contains("/play/")) {
+            try { app.get(fixUrl(playBtn), headers = headers).document } catch (_: Exception) { document }
+        } else {
+            document
+        }
+
+        // B. Extract episodes from Inertia JSON
+        val dataPage = targetDoc.selectFirst("#app, [data-page]")?.attr("data-page")
+            ?: document.selectFirst("#app, [data-page]")?.attr("data-page")
+
         if (!dataPage.isNullOrBlank()) {
             try {
                 val json = JSONObject(dataPage)
@@ -140,13 +156,13 @@ class StardimaProvider : MainAPI() {
             }
         }
 
-        // B. Fallback from HTML play links
+        // C. Fallback to HTML play links
         if (episodes.isEmpty()) {
-            val epElements = document.select("a[href*='/play/']")
+            val epElements = targetDoc.select("a[href*='/play/']")
             for ((index, el) in epElements.distinctBy { it.attr("href") }.withIndex()) {
                 val epHref = fixUrl(el.attr("href"))
                 val epName = el.text().trim().ifEmpty { "الحلقة ${index + 1}" }
-                if (!epName.contains("تسجيل الدخول")) {
+                if (!epName.contains("تسجيل الدخول") && !epName.contains("تشغيل")) {
                     episodes.add(
                         newEpisode(epHref) {
                             this.name = epName
@@ -158,8 +174,9 @@ class StardimaProvider : MainAPI() {
         }
 
         if (episodes.isEmpty()) {
+            val fallbackPlay = playBtn?.let { fixUrl(it) } ?: url
             episodes.add(
-                newEpisode(url) {
+                newEpisode(fallbackPlay) {
                     this.name = title
                     this.episode = 1
                 }
@@ -180,7 +197,7 @@ class StardimaProvider : MainAPI() {
         }
     }
 
-    // 4. Resolve Hyperwatching Video ID (Handles Escaped Slashes)
+    // 4. Resolve Hyperwatching Video ID & Intercept Cloudflare
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -191,7 +208,7 @@ class StardimaProvider : MainAPI() {
         val rawHtml = document.html()
         val cleanHtml = rawHtml.replace("\\/", "/")
 
-        // Flexible regex that matches both unescaped and escaped URLs
+        // Flexible regex matching both unescaped and JSON-escaped URLs
         val videoPattern = Regex("""hyperwatching\.com(?:\\?/|/)(?:watch|embed)(?:\\?/|/)([a-zA-Z0-9]+)""")
         var videoId = videoPattern.find(rawHtml)?.groupValues?.get(1)
             ?: videoPattern.find(cleanHtml)?.groupValues?.get(1)
@@ -206,7 +223,7 @@ class StardimaProvider : MainAPI() {
         }
 
         if (!videoId.isNullOrBlank()) {
-            return fetchHyperwatchingServers(videoId, data, rawHtml, subtitleCallback, callback)
+            return resolveViaCloudflareInterception(videoId, data, subtitleCallback, callback)
         }
 
         // Direct iframes fallback
@@ -220,19 +237,50 @@ class StardimaProvider : MainAPI() {
         return true
     }
 
-    // 5. Query /embed/{id}/server/{serverId}/url for each server
-    private suspend fun fetchHyperwatchingServers(
+    // 5. Cloudflare Interception & Multi-Server Resolution
+    private suspend fun resolveViaCloudflareInterception(
         videoId: String,
         episodePageUrl: String,
-        playPageHtml: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val watchUrl = "https://v2.hyperwatching.com/watch/$videoId"
-        val serverList = ArrayList<Pair<String, String>>() // Pair(serverId, serverName)
+        var foundAnyLink = false
 
-        fun extractServersFromText(text: String) {
-            val clean = text.replace("\\/", "/")
+        // STEP 1: Use WebViewResolver to solve Cloudflare Turnstile & catch the active server JSON
+        try {
+            val resolver = WebViewResolver(
+                interceptUrl = Regex("""/server/\d+/url|/embed/.*/url"""),
+                useOkhttp = false
+            )
+
+            val interceptResponse = app.get(watchUrl, referer = episodePageUrl, interceptor = resolver)
+            val jsonBody = interceptResponse.text
+
+            if (jsonBody.contains("\"status\"") && jsonBody.contains("\"ok\"")) {
+                processServerJson(jsonBody, "السيرفر الأساسي", watchUrl, subtitleCallback, callback)
+                foundAnyLink = true
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+
+        // STEP 2: Use the harvested Cloudflare clearance cookies to fetch the other servers
+        try {
+            val cfCookie = CookieManager.getInstance().getCookie("https://v2.hyperwatching.com") ?: ""
+
+            val apiHeaders = mapOf(
+                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                "Referer" to watchUrl,
+                "X-Requested-With" to "XMLHttpRequest",
+                "Accept" to "application/json, text/plain, */*",
+                "Cookie" to cfCookie
+            )
+
+            val pageHtml = app.get(watchUrl, headers = apiHeaders).text
+            val clean = pageHtml.replace("\\/", "/")
+
+            val serverList = ArrayList<Pair<String, String>>()
             val p1 = Regex("""(?:&quot;|")id(?:&quot;|")\s*:\s*(\d+).*?(?:&quot;|")name(?:&quot;|")\s*:\s*(?:&quot;|")([^"&]+)(?:&quot;|")""")
             val p2 = Regex("""(?:&quot;|")name(?:&quot;|")\s*:\s*(?:&quot;|")([^"&]+)(?:&quot;|").*?(?:&quot;|")id(?:&quot;|")\s*:\s*(\d+)""")
             val p3 = Regex("""(?:&quot;|")slug(?:&quot;|")\s*:\s*(?:&quot;|")([^"&]+)(?:&quot;|").*?(?:&quot;|")id(?:&quot;|")\s*:\s*(\d+)""")
@@ -240,51 +288,24 @@ class StardimaProvider : MainAPI() {
             for (m in p1.findAll(clean)) serverList.add(Pair(m.groupValues[1], m.groupValues[2]))
             for (m in p2.findAll(clean)) serverList.add(Pair(m.groupValues[2], m.groupValues[1]))
             for (m in p3.findAll(clean)) serverList.add(Pair(m.groupValues[2], m.groupValues[1]))
-        }
 
-        // A. Extract servers from Stardima play page
-        extractServersFromText(playPageHtml)
+            // Query /embed/{id}/server/{serverId}/url for each server
+            for ((serverId, serverName) in serverList.distinctBy { it.first }) {
+                try {
+                    val serverUrlEndpoint = "https://v2.hyperwatching.com/embed/$videoId/server/$serverId/url"
+                    val res = app.get(serverUrlEndpoint, headers = apiHeaders).text
 
-        // B. If not present locally, fetch from Hyperwatching watch page
-        if (serverList.isEmpty()) {
-            try {
-                val mobileHeaders = mapOf(
-                    "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36",
-                    "Referer" to episodePageUrl,
-                    "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
-                )
-                val pageHtml = app.get(watchUrl, headers = mobileHeaders).text
-                extractServersFromText(pageHtml)
-            } catch (e: Exception) {
-                e.printStackTrace()
+                    if (res.contains("\"status\"") && res.contains("\"ok\"")) {
+                        processServerJson(res, serverName, watchUrl, subtitleCallback, callback)
+                        foundAnyLink = true
+                    }
+                } catch (_: Exception) {}
             }
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
 
-        // C. Query endpoint for every server discovered
-        val apiHeaders = mapOf(
-            "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36",
-            "Referer" to watchUrl,
-            "X-Requested-With" to "XMLHttpRequest",
-            "Accept" to "application/json, text/plain, */*"
-        )
-
-        var foundLink = false
-
-        for ((serverId, serverName) in serverList.distinctBy { it.first }) {
-            try {
-                val serverUrlEndpoint = "https://v2.hyperwatching.com/embed/$videoId/server/$serverId/url"
-                val res = app.get(serverUrlEndpoint, headers = apiHeaders).text
-
-                if (res.contains("\"status\"") && res.contains("\"ok\"")) {
-                    processServerJson(res, serverName, watchUrl, subtitleCallback, callback)
-                    foundLink = true
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
-        }
-
-        return foundLink
+        return foundAnyLink
     }
 
     private suspend fun processServerJson(
@@ -322,7 +343,7 @@ class StardimaProvider : MainAPI() {
             }
         }
 
-        // 2. Embed URL (strema.top, Uqload, Mixdrop, Goodstream, etc.)
+        // 2. Embed URL (strema.top for Lulustream, Uqload, Mixdrop, Goodstream, etc.)
         val embedUrl = json.optString("embed_url")
         if (embedUrl.isNotEmpty()) {
             if (!loadExtractor(embedUrl, referer, subtitleCallback, callback)) {
@@ -336,7 +357,7 @@ class StardimaProvider : MainAPI() {
             callback(
                 ExtractorLink(
                     source = name,
-                    name = "ستارديما - $serverName (تحميل/سيرفر)",
+                    name = "ستارديما - $serverName (سيرفر احتياطي)",
                     url = downloadUrl,
                     referer = referer,
                     quality = Qualities.P720.value,
@@ -401,6 +422,3 @@ class StardimaProvider : MainAPI() {
         return java.net.URLEncoder.encode(str, "UTF-8")
     }
 }
-
-
-
