@@ -296,6 +296,8 @@ class StardimaProvider : MainAPI() {
         }
     }
 
+
+
     private fun unpackJs(script: String): String {
         return try {
             val packerPattern = Regex("""eval\(function\(p,a,c,k,e,d\)\{.*?\}\('(.*?)',(\d+),(\d+),'(.*?)'\.split\('\|'\)""")
