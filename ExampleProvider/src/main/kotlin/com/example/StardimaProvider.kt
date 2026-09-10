@@ -5,6 +5,7 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
+import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
@@ -21,7 +22,7 @@ class StardimaProvider : MainAPI() {
         "Referer" to "$mainUrl/"
     )
 
-    // 1. Home Page Sections (Restored to working DooPlay structure)
+    // 1. Browsing Sections (DooPlay)
     override val mainPage = mainPageOf(
         "$mainUrl/tvshows/" to "المسلسلات الكرتونية (Cartoons)",
         "$mainUrl/episodes/" to "أحدث الحلقات (Latest Episodes)",
@@ -68,7 +69,7 @@ class StardimaProvider : MainAPI() {
         }
     }
 
-    // 3. Load Show / Movie Details & Seasons
+    // 3. Load Show Details & Episodes
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url, headers = headers).document
 
@@ -129,7 +130,7 @@ class StardimaProvider : MainAPI() {
         }
     }
 
-    // 4. Resolve Hyperwatching Multi-Server Streams
+    // 4. Resolve Links via Exact Hyperwatching /embed/{id}/server/{serverId}/url Endpoint
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -137,22 +138,19 @@ class StardimaProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val document = app.get(data, headers = headers).document
+        val html = document.html()
 
-        // Check if page embeds Hyperwatching (e.g. https://v2.hyperwatching.com/watch/{code})
-        val hyperwatchingUrl = document.select("iframe").mapNotNull { 
-            val src = it.attr("src").ifEmpty { it.attr("data-src") }
-            if (src.contains("hyperwatching.com/watch/")) fixUrl(src) else null
-        }.firstOrNull()
+        // Extract the Hyperwatching video ID (e.g. 6YQBcQR8DT1z)
+        val videoIdMatch = Regex("""hyperwatching\.com/(?:watch|embed)/([a-zA-Z0-9]+)""").find(html)
+            ?: Regex("""hyperwatching\.com/(?:watch|embed)/([a-zA-Z0-9]+)""").find(data)
 
-        if (hyperwatchingUrl != null) {
-            val videoId = hyperwatchingUrl.substringAfter("/watch/").substringBefore("?").trim()
-            if (videoId.isNotEmpty()) {
-                resolveHyperwatching(videoId, hyperwatchingUrl, subtitleCallback, callback)
-                return true
-            }
+        if (videoIdMatch != null) {
+            val videoId = videoIdMatch.groupValues[1]
+            fetchHyperwatchingServers(videoId, subtitleCallback, callback)
+            return true
         }
 
-        // Fallback: Check for other direct iframes or buttons on the page
+        // Direct iframes fallback
         document.select("iframe, .playex iframe").forEach { iframe ->
             val src = fixUrl(iframe.attr("src").ifEmpty { iframe.attr("data-src") })
             if (src.startsWith("http") && !src.contains("hyperwatching.com")) {
@@ -163,55 +161,82 @@ class StardimaProvider : MainAPI() {
         return true
     }
 
-    // Resolves all 6 servers from Screenshot 2: Uqload, Lulustream, Goodstream, Savefiles, Mixdrop, Streamhg
-    private suspend fun resolveHyperwatching(
+    private suspend fun fetchHyperwatchingServers(
         videoId: String,
-        embedPageUrl: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        val servers = listOf("lulustream", "uqload", "goodstream", "savefiles", "mixdrop", "streamhg")
+        val watchUrl = "https://v2.hyperwatching.com/watch/$videoId"
+        val inertiaHeaders = mapOf(
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Referer" to watchUrl,
+            "X-Inertia" to "true",
+            "X-Requested-With" to "XMLHttpRequest",
+            "Accept" to "text/html, application/xhtml+xml, application/json, text/plain, */*"
+        )
 
+        val serverList = ArrayList<Pair<String, String>>() // Pair(serverId, serverName)
+
+        try {
+            // 1. Fetch the Inertia watch page to read server IDs
+            val pageRes = app.get(watchUrl, headers = inertiaHeaders)
+            val body = pageRes.text
+
+            // Check Inertia JSON or parse <div id="app" data-page="...">
+            val jsonString = if (body.startsWith("{") && body.endsWith("}")) {
+                body
+            } else {
+                val doc = Jsoup.parse(body)
+                doc.selectFirst("#app, [data-page]")?.attr("data-page") ?: ""
+            }
+
+            if (jsonString.isNotEmpty()) {
+                val dataObj = JSONObject(jsonString)
+                val props = dataObj.optJSONObject("props")
+                
+                // Find servers array inside props
+                val serversArray = props?.optJSONArray("servers")
+                    ?: props?.optJSONObject("video")?.optJSONArray("servers")
+                    ?: props?.optJSONObject("episode")?.optJSONArray("servers")
+
+                if (serversArray != null) {
+                    for (i in 0 until serversArray.length()) {
+                        val sObj = serversArray.optJSONObject(i) ?: continue
+                        val sId = sObj.optString("id").ifEmpty { sObj.optInt("id").toString() }
+                        val sName = sObj.optString("name").ifEmpty { sObj.optString("slug", "Server") }
+                        if (sId.isNotEmpty()) {
+                            serverList.add(Pair(sId, sName))
+                        }
+                    }
+                }
+            }
+
+            // Regex fallback if JSON layout is deeply nested
+            if (serverList.isEmpty()) {
+                val regex = Regex("""["']id["']\s*:\s*(\d+)\s*,\s*["']name["']\s*:\s*["']([^"']+)["']""")
+                for (match in regex.findAll(body)) {
+                    serverList.add(Pair(match.groupValues[1], match.groupValues[2]))
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+
+        // 2. Query each server URL endpoint: /embed/{videoId}/server/{serverId}/url
         val apiHeaders = mapOf(
-            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Referer" to embedPageUrl,
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Referer" to watchUrl,
             "X-Requested-With" to "XMLHttpRequest",
             "Accept" to "application/json, text/plain, */*"
         )
 
-        val baseDomain = if (embedPageUrl.contains("v2.hyperwatching.com")) {
-            "https://v2.hyperwatching.com"
-        } else {
-            "https://hyperwatching.com"
-        }
-
-        // Candidate API endpoints
-        val endpoints = listOf(
-            "$baseDomain/api/source",
-            "$baseDomain/api/player",
-            "$baseDomain/ajax/source",
-            "$baseDomain/source"
-        )
-
-        var workingEndpoint: String? = null
-
-        for (server in servers) {
+        for ((serverId, serverName) in serverList.distinctBy { it.first }) {
             try {
-                // Find working endpoint if not yet discovered
-                if (workingEndpoint == null) {
-                    for (ep in endpoints) {
-                        val testUrl = "$ep?id=$videoId&host=$server&download="
-                        val res = app.get(testUrl, headers = apiHeaders).text
-                        if (res.contains("\"status\"") && res.contains("\"ok\"")) {
-                            workingEndpoint = ep
-                            processHyperwatchingJson(res, server, embedPageUrl, subtitleCallback, callback)
-                            break
-                        }
-                    }
-                } else {
-                    val reqUrl = "$workingEndpoint?id=$videoId&host=$server&download="
-                    val res = app.get(reqUrl, headers = apiHeaders).text
-                    processHyperwatchingJson(res, server, embedPageUrl, subtitleCallback, callback)
+                val serverApiUrl = "https://v2.hyperwatching.com/embed/$videoId/server/$serverId/url"
+                val res = app.get(serverApiUrl, headers = apiHeaders).text
+
+                if (res.contains("\"status\"") && res.contains("\"ok\"")) {
+                    processServerResponse(res, serverName, watchUrl, subtitleCallback, callback)
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
@@ -219,7 +244,7 @@ class StardimaProvider : MainAPI() {
         }
     }
 
-    private suspend fun processHyperwatchingJson(
+    private suspend fun processServerResponse(
         jsonString: String,
         serverName: String,
         referer: String,
@@ -229,7 +254,7 @@ class StardimaProvider : MainAPI() {
         val json = try { JSONObject(jsonString) } catch (e: Exception) { return }
         if (json.optString("status") != "ok") return
 
-        // 1. Direct sources inside the JSON (if returned)
+        // 1. Direct sources array (e.g. direct mp4 or m3u8)
         val sources = json.optJSONArray("sources")
         if (sources != null && sources.length() > 0) {
             for (i in 0 until sources.length()) {
@@ -254,17 +279,16 @@ class StardimaProvider : MainAPI() {
             }
         }
 
-        // 2. Embed URL (e.g. strema.top for Lulustream, uqload, mixdrop)
+        // 2. Embed URL (e.g. strema.top for Lulustream, Uqload, Mixdrop)
         val embedUrl = json.optString("embed_url")
         if (embedUrl.isNotEmpty()) {
             if (!loadExtractor(embedUrl, referer, subtitleCallback, callback)) {
-                // Resolves strema.top / custom JWPlayer hosts
+                // Unpack strema.top JWPlayer
                 resolveStremaJWPlayer(embedUrl, serverName, callback)
             }
         }
     }
 
-    // Unpacks Dean Edwards JavaScript & extracts the raw .m3u8 / .mp4 from JWPlayer
     private suspend fun resolveStremaJWPlayer(
         embedUrl: String,
         serverName: String,
@@ -296,8 +320,6 @@ class StardimaProvider : MainAPI() {
         }
     }
 
-
-
     private fun unpackJs(script: String): String {
         return try {
             val packerPattern = Regex("""eval\(function\(p,a,c,k,e,d\)\{.*?\}\('(.*?)',(\d+),(\d+),'(.*?)'\.split\('\|'\)""")
@@ -305,6 +327,7 @@ class StardimaProvider : MainAPI() {
 
             val payload = match.groupValues[1]
             val radix = match.groupValues[2].toInt()
+            val count = match.groupValues[3].toInt()
             val symTab = match.groupValues[4].split("|")
 
             fun lookup(word: String): String {
