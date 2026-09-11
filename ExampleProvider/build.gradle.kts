@@ -4,8 +4,8 @@ dependencies {
 }
 
 // Cloudstream requires an integer version code; pluginVersion is the release version.
-val pluginVersion = "0.0.2"
-version = 2
+val pluginVersion = "0.0.3"
+version = 3
 
 cloudstream {
     // All of these properties are optional, you can safely remove any of them.

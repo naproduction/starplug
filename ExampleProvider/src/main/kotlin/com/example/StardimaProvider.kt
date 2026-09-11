@@ -242,8 +242,12 @@ class StardimaProvider : MainAPI() {
         if (!videoId.isNullOrBlank()) {
             val serverIds = LinkedHashSet<String>()
 
-            document.selectFirst("#app")?.attr("data-page")?.takeIf { it.isNotBlank() }?.let { playerData ->
-                try {
+            try {
+                val playerDocument = app.get(
+                    "https://v2.hyperwatching.com/watch/$videoId",
+                    headers = headers + mapOf("Referer" to targetUrl)
+                ).document
+                playerDocument.selectFirst("#app")?.attr("data-page")?.takeIf { it.isNotBlank() }?.let { playerData ->
                     val video = JSONObject(playerData).optJSONObject("props")?.optJSONObject("video")
                     video?.optString("hashid")?.takeIf { it.isNotBlank() }?.let { videoId = it }
                     val servers = video?.optJSONArray("servers")
@@ -254,8 +258,8 @@ class StardimaProvider : MainAPI() {
                             if (serverId > 0) serverIds.add(serverId.toString())
                         }
                     }
-                } catch (_: Exception) {}
-            }
+                }
+            } catch (_: Exception) {}
 
             // Read server IDs from HTML
             val idPattern = Regex("""(?:&quot;|")id(?:&quot;|")\s*:\s*(\d{5,8})""")
