@@ -32,25 +32,7 @@ class StardimaProvider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         val document = app.get(request.data, headers = headers).document
-
-        val items = document.select("img[alt*='Poster'], img[alt*='بوستر']").mapNotNull { img ->
-            val parentLink = img.parents().select("a[href]").firstOrNull() ?: img.closest("a")
-            val href = fixUrlNull(parentLink?.attr("href")) ?: return@mapNotNull null
-            if (!href.contains("/tvshow/") && !href.contains("/movie/")) return@mapNotNull null
-            if (href.contains("/play/")) return@mapNotNull null
-
-            val rawTitle = img.attr("alt")
-            val title = rawTitle.replace("Poster for ", "").replace("Poster for", "").trim()
-            if (title.isBlank() || title.contains("تسجيل الدخول")) return@mapNotNull null
-
-            val poster = fixUrlNull(img.attr("src").ifEmpty { img.attr("data-src") })
-            val isMovie = href.contains("/movie/")
-            val type = if (isMovie) TvType.Movie else TvType.Cartoon
-
-            newAnimeSearchResponse(title, href, type) {
-                this.posterUrl = poster
-            }
-        }.distinctBy { it.url }
+        val items = parseContentCards(document).take(if (request.data == mainUrl) 12 else 30)
 
         return newHomePageResponse(request.name, items, hasNext = false)
     }
@@ -60,22 +42,21 @@ class StardimaProvider : MainAPI() {
         val url = "$mainUrl/search?q=${encodeUrl(query)}"
         val document = app.get(url, headers = headers).document
 
-        return document.select("img[alt*='Poster'], img[alt*='بوستر']").mapNotNull { img ->
-            val parentLink = img.parents().select("a[href]").firstOrNull() ?: img.closest("a")
-            val href = fixUrlNull(parentLink?.attr("href")) ?: return@mapNotNull null
-            if (!href.contains("/tvshow/") && !href.contains("/movie/")) return@mapNotNull null
-            if (href.contains("/play/")) return@mapNotNull null
+        return parseContentCards(document)
+    }
 
-            val rawTitle = img.attr("alt")
-            val title = rawTitle.replace("Poster for ", "").replace("Poster for", "").trim()
+    private fun parseContentCards(document: org.jsoup.nodes.Document): List<SearchResponse> {
+        return document.select("a[href^='/tvshow/'], a[href^='/movie/']").mapNotNull { card ->
+            val img = card.selectFirst("img[alt^='Poster'], img[alt*='بوستر']")
+                ?: return@mapNotNull null
+            val href = fixUrlNull(card.attr("href")) ?: return@mapNotNull null
+            val title = img.attr("alt")
+                .removePrefix("Poster for")
+                .trim()
             if (title.isBlank() || title.contains("تسجيل الدخول")) return@mapNotNull null
 
-            val poster = fixUrlNull(img.attr("src").ifEmpty { img.attr("data-src") })
-            val isMovie = href.contains("/movie/")
-            val type = if (isMovie) TvType.Movie else TvType.Cartoon
-
-            newAnimeSearchResponse(title, href, type) {
-                this.posterUrl = poster
+            newAnimeSearchResponse(title, href, if (href.contains("/movie/")) TvType.Movie else TvType.Cartoon) {
+                posterUrl = fixUrlNull(img.attr("src").ifEmpty { img.attr("data-src") })
             }
         }.distinctBy { it.url }
     }
@@ -181,6 +162,44 @@ class StardimaProvider : MainAPI() {
                         this.episode = index + 1
                     }
                 )
+            }
+        }
+
+        // The series page only exposes the current "watch now" episode. Its
+        // player page contains the complete season list.
+        if (!url.contains("/movie/") && episodes.size <= 1) {
+            val firstPlayUrl = document.select("a[href*='/play/']")
+                .mapNotNull { fixUrlNull(it.attr("href")) }
+                .firstOrNull()
+
+            if (firstPlayUrl != null) {
+                try {
+                    val playDocument = app.get(firstPlayUrl, headers = headers).document
+                    val allEpisodes = playDocument.select("a[href*='/play/']")
+                        .mapNotNull { link ->
+                            val episodeId = Regex("""/play/([^/?#]+)""")
+                                .find(link.attr("href"))?.groupValues?.get(1)
+                                ?: return@mapNotNull null
+                            val titleText = link.text().trim()
+                            val numberMatch = Regex("""S(\d+)E(\d+)""", RegexOption.IGNORE_CASE)
+                                .find(titleText)
+                            val season = numberMatch?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 1
+                            val episode = numberMatch?.groupValues?.getOrNull(2)?.toIntOrNull()
+                                ?: (episodes.size + 1)
+
+                            newEpisode("$mainUrl/tvshow/$showId/play/$episodeId") {
+                                name = titleText.ifBlank { "الحلقة $episode" }
+                                this.season = season
+                                this.episode = episode
+                            }
+                        }
+                        .distinctBy { it.data }
+
+                    if (allEpisodes.isNotEmpty()) {
+                        episodes.clear()
+                        episodes.addAll(allEpisodes)
+                    }
+                } catch (_: Exception) {}
             }
         }
 
