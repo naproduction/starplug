@@ -1,0 +1,11 @@
+R_DEF: Internal format may change without notice
+local
+drawable ic_android_24dp
+id imageView
+id imageView2
+id mainFragmentLayout
+id textView
+id textView2
+layout fragment_blank
+string hello_fragment
+string loaded_from_app_trans
