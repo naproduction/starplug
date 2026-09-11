@@ -46,19 +46,29 @@ class StardimaProvider : MainAPI() {
     }
 
     private fun parseContentCards(document: org.jsoup.nodes.Document): List<SearchResponse> {
-        return document.select("a[href^='/tvshow/'], a[href^='/movie/']").mapNotNull { card ->
-            val img = card.selectFirst("img[alt^='Poster'], img[alt*='بوستر']")
+        return document.select("img[alt^='Poster for ']").mapNotNull { image ->
+            val card = image.parents().firstOrNull { parent ->
+                parent.select("a[href]").any { link ->
+                    val href = fixUrlNull(link.attr("href")) ?: return@any false
+                    isContentUrl(href)
+                }
+            } ?: return@mapNotNull null
+
+            val href = card.select("a[href]")
+                .mapNotNull { fixUrlNull(it.attr("href")) }
+                .firstOrNull(::isContentUrl)
                 ?: return@mapNotNull null
-            val href = fixUrlNull(card.attr("href")) ?: return@mapNotNull null
-            val title = img.attr("alt")
-                .removePrefix("Poster for")
-                .trim()
+            val title = image.attr("alt").removePrefix("Poster for").trim()
             if (title.isBlank() || title.contains("تسجيل الدخول")) return@mapNotNull null
 
             newAnimeSearchResponse(title, href, if (href.contains("/movie/")) TvType.Movie else TvType.Cartoon) {
-                posterUrl = fixUrlNull(img.attr("src").ifEmpty { img.attr("data-src") })
+                posterUrl = fixUrlNull(image.attr("src").ifEmpty { image.attr("data-src") })
             }
         }.distinctBy { it.url }
+    }
+
+    private fun isContentUrl(url: String): Boolean {
+        return url.startsWith("$mainUrl/tvshow/") || url.startsWith("$mainUrl/movie/")
     }
 
     // 3. Load Show Details & Parse All Seasons/Episodes from JSON
