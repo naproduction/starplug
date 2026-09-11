@@ -47,16 +47,13 @@ class StardimaProvider : MainAPI() {
 
     private fun parseContentCards(document: org.jsoup.nodes.Document): List<SearchResponse> {
         return document.select("img[alt^='Poster for ']").mapNotNull { image ->
-            val card = image.parents().firstOrNull { parent ->
-                parent.select("a[href]").any { link ->
-                    val href = fixUrlNull(link.attr("href")) ?: return@any false
-                    isContentUrl(href)
+            val directLink = image.closest("a[href]")
+            val href = directLink?.attr("href")?.let(::fixUrlNull)?.takeIf(::isContentUrl)
+                ?: image.parents().firstNotNullOfOrNull { parent ->
+                    parent.select("> a[href]")
+                        .mapNotNull { fixUrlNull(it.attr("href")) }
+                        .firstOrNull(::isContentUrl)
                 }
-            } ?: return@mapNotNull null
-
-            val href = card.select("a[href]")
-                .mapNotNull { fixUrlNull(it.attr("href")) }
-                .firstOrNull(::isContentUrl)
                 ?: return@mapNotNull null
             val title = image.attr("alt").removePrefix("Poster for").trim()
             if (title.isBlank() || title.contains("تسجيل الدخول")) return@mapNotNull null
@@ -68,12 +65,15 @@ class StardimaProvider : MainAPI() {
     }
 
     private fun isContentUrl(url: String): Boolean {
-        return url.startsWith("$mainUrl/tvshow/") || url.startsWith("$mainUrl/movie/")
+        return url.startsWith("$mainUrl/tvshow/") ||
+            url.startsWith("$mainUrl/movie/") ||
+            url.startsWith("$mainUrl/play/")
     }
 
     // 3. Load Show Details & Parse All Seasons/Episodes from JSON
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url, headers = headers).document
+        val isMovie = url.contains("/movie/") || url.startsWith("$mainUrl/play/")
 
         val title = document.selectFirst("meta[property='og:title']")?.attr("content")
             ?.substringBefore("-")?.replace("مشاهدة وتحميل", "")?.replace("مسلسل", "")?.replace("كرتون", "")?.trim()
@@ -158,7 +158,7 @@ class StardimaProvider : MainAPI() {
         if (episodes.isEmpty()) {
             val epElements = document.select("a[href*='/play/']")
             for ((index, el) in epElements.distinctBy { it.attr("href") }.withIndex()) {
-                val epHref = fixUrl(el.attr("href"))
+                val epHref = fixUrl(el.attr("href").replace("/tvshow/undefined/", "/tvshow/$showId/"))
                 val rawName = el.text().trim()
                 val epName = if (rawName.isNotBlank() && !rawName.contains("تسجيل الدخول") && !rawName.contains("تشغيل")) {
                     rawName
@@ -186,16 +186,18 @@ class StardimaProvider : MainAPI() {
                 try {
                     val playDocument = app.get(firstPlayUrl, headers = headers).document
                     val allEpisodes = playDocument.select("a[href*='/play/']")
-                        .mapNotNull { link ->
+                        .mapIndexedNotNull { index, link ->
                             val episodeId = Regex("""/play/([^/?#]+)""")
                                 .find(link.attr("href"))?.groupValues?.get(1)
-                                ?: return@mapNotNull null
+                                ?: return@mapIndexedNotNull null
                             val titleText = link.text().trim()
                             val numberMatch = Regex("""S(\d+)E(\d+)""", RegexOption.IGNORE_CASE)
                                 .find(titleText)
                             val season = numberMatch?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 1
                             val episode = numberMatch?.groupValues?.getOrNull(2)?.toIntOrNull()
-                                ?: (episodes.size + 1)
+                                ?: Regex("""(?:^|\D)(\d{1,3})\s*[-|]""")
+                                    .find(titleText)?.groupValues?.getOrNull(1)?.toIntOrNull()
+                                ?: (index + 1)
 
                             newEpisode("$mainUrl/tvshow/$showId/play/$episodeId") {
                                 name = titleText.ifBlank { "الحلقة $episode" }
@@ -213,9 +215,16 @@ class StardimaProvider : MainAPI() {
             }
         }
 
-        val isMovie = url.contains("/movie/")
         return if (isMovie) {
-            newMovieLoadResponse(title, url, TvType.Movie, url) {
+            val playUrl = document.select("a[href^='/play/']")
+                .mapNotNull { fixUrl(it.attr("href")) }
+                .firstOrNull()
+                ?: if (url.startsWith("$mainUrl/movie/")) {
+                    "$mainUrl/play/${url.substringAfter("/movie/").substringBefore("/")}"
+                } else {
+                    url
+                }
+            newMovieLoadResponse(title, url, TvType.Movie, playUrl) {
                 this.posterUrl = poster
                 this.plot = description
             }
