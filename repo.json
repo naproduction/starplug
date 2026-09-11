@@ -1,8 +1,0 @@
-{
-  "name": "Stardima Repo",
-  "description": "Cartoons from Stardima",
-  "manifestVersion": 1,
-  "pluginLists": [
-    "https://raw.githubusercontent.com/naproduction/starplug/builds/plugins.json"
-  ]
-}
