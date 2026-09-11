@@ -1,10 +1,10 @@
 [
     {
         "iconUrl": "https://upload.wikimedia.org/wikipedia/commons/2/2f/Korduene_Logo.png",
-        "fileHash": "sha256-3b6661cc2ac590a29e005a79cfc610f59aa8818d19fe92cade11e16ce861f6b7",
+        "fileHash": "sha256-d22aa90089e0ac59c7fcda5526f119eacb08490124e3ec58d8d335d454d8de95",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/naproduction/starplug",
-        "fileSize": 28550,
+        "fileSize": 30506,
         "status": 1,
         "language": "en",
         "authors": [
@@ -14,7 +14,7 @@
         "tvTypes": [
             "Movie"
         ],
-        "version": 3,
+        "version": 4,
         "internalName": "ExampleProvider",
         "description": "Stardima",
         "url": "https://raw.githubusercontent.com/naproduction/starplug/builds/ExampleProvider.cs3",
