@@ -3,8 +3,9 @@ dependencies {
     implementation("androidx.recyclerview:recyclerview:1.3.2")
 }
 
-// Use an integer for version numbers
-version = 26
+// Cloudstream requires an integer version code; pluginVersion is the release version.
+val pluginVersion = "0.0.1"
+version = 1
 
 cloudstream {
     // All of these properties are optional, you can safely remove any of them.
