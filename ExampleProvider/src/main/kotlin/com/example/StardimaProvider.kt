@@ -242,18 +242,25 @@ class StardimaProvider : MainAPI() {
         if (!videoId.isNullOrBlank()) {
             val serverIds = LinkedHashSet<String>()
 
+            document.selectFirst("#app")?.attr("data-page")?.takeIf { it.isNotBlank() }?.let { playerData ->
+                try {
+                    val video = JSONObject(playerData).optJSONObject("props")?.optJSONObject("video")
+                    video?.optString("hashid")?.takeIf { it.isNotBlank() }?.let { videoId = it }
+                    val servers = video?.optJSONArray("servers")
+                    for (i in 0 until (servers?.length() ?: 0)) {
+                        val server = servers?.optJSONObject(i) ?: continue
+                        if (server.optString("status") == "completed") {
+                            val serverId = server.optLong("id", 0L)
+                            if (serverId > 0) serverIds.add(serverId.toString())
+                        }
+                    }
+                } catch (_: Exception) {}
+            }
+
             // Read server IDs from HTML
             val idPattern = Regex("""(?:&quot;|")id(?:&quot;|")\s*:\s*(\d{5,8})""")
             for (m in idPattern.findAll(cleanHtml)) {
                 serverIds.add(m.groupValues[1])
-            }
-
-            // Probe adjacent server IDs around the confirmed ID
-            if (serverIds.isEmpty()) {
-                val baseId = 861929
-                for (offset in -4..5) {
-                    serverIds.add((baseId + offset).toString())
-                }
             }
 
             val apiHeaders = mapOf(
@@ -268,10 +275,7 @@ class StardimaProvider : MainAPI() {
                     val apiUrl = "https://v2.hyperwatching.com/embed/$videoId/server/$sId/url"
                     val res = app.get(apiUrl, headers = apiHeaders).text
 
-                    if (res.contains("\"status\"") && res.contains("\"ok\"")) {
-                        processServerJson(res, targetUrl, subtitleCallback, callback)
-                        foundAny = true
-                    }
+                    foundAny = processServerJson(res, targetUrl, subtitleCallback, callback) || foundAny
                 } catch (_: Exception) {}
             }
         }
@@ -300,9 +304,11 @@ class StardimaProvider : MainAPI() {
         referer: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
-    ) {
-        val json = try { JSONObject(jsonString) } catch (e: Exception) { return }
-        if (json.optString("status") != "ok") return
+    ): Boolean {
+        val json = try { JSONObject(jsonString) } catch (e: Exception) { return false }
+        if (json.optString("status") != "ok" && json.optString("watch_url").isEmpty()) return false
+
+        var foundAny = false
 
         val queryObj = json.optJSONObject("query")
         val hostName = queryObj?.optString("host")?.replaceFirstChar { it.uppercase() } ?: "سيرفر"
@@ -328,15 +334,18 @@ class StardimaProvider : MainAPI() {
                             type = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                         )
                     )
+                    foundAny = true
                 }
             }
         }
 
-        // 2. Embed URL (strema.top, Uqload, Mixdrop, Goodstream, etc.)
-        val embedUrl = json.optString("embed_url")
-        if (embedUrl.isNotEmpty()) {
-            if (!loadExtractor(embedUrl, referer, subtitleCallback, callback)) {
-                resolveStremaJWPlayer(embedUrl, hostName, callback)
+        // 2. Current Hyperwatching responses expose the player as watch_url.
+        val playerUrl = json.optString("watch_url").ifEmpty { json.optString("embed_url") }
+        if (playerUrl.isNotEmpty()) {
+            if (loadExtractor(playerUrl, referer, subtitleCallback, callback)) {
+                foundAny = true
+            } else {
+                foundAny = resolveStremaJWPlayer(playerUrl, hostName, callback) || foundAny
             }
         }
 
@@ -353,14 +362,17 @@ class StardimaProvider : MainAPI() {
                     type = if (downloadUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                 )
             )
+            foundAny = true
         }
+
+        return foundAny
     }
 
     private suspend fun resolveStremaJWPlayer(
         embedUrl: String,
         serverName: String,
         callback: (ExtractorLink) -> Unit
-    ) {
+    ): Boolean {
         try {
             val res = app.get(embedUrl, headers = headers + mapOf("Referer" to "https://v2.hyperwatching.com/")).text
             val unpacked = unpackJs(res)
@@ -380,10 +392,10 @@ class StardimaProvider : MainAPI() {
                         type = ExtractorLinkType.M3U8
                     )
                 )
+                return true
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
+        } catch (_: Exception) {}
+        return false
     }
 
     private fun unpackJs(script: String): String {
