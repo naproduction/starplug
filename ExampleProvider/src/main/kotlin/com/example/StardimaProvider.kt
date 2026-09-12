@@ -201,33 +201,56 @@ class StardimaProvider : MainAPI() {
             if (firstPlayUrl != null) {
                 try {
                     val playDocument = app.get(firstPlayUrl, headers = headers).document
-                    val allEpisodes = playDocument.select("a[href*='/play/']")
-                        .distinctBy { it.attr("href") }
-                        .mapIndexedNotNull { index, link ->
-                            val episodeId = Regex("""/play/([^/?#]+)""")
-                                .find(link.attr("href"))?.groupValues?.get(1)
-                                ?: return@mapIndexedNotNull null
-                            val titleText = link.text().trim()
-                            val seasonEpisode = Regex("""S(\d+)\s*E(\d+)""", RegexOption.IGNORE_CASE)
-                                .find(titleText)
-                            val season = seasonEpisode?.groupValues?.getOrNull(1)?.toIntOrNull()
-                                ?: Regex("""(?:الموسم|season)\s*(\d+)""", RegexOption.IGNORE_CASE)
-                                    .find(titleText)?.groupValues?.getOrNull(1)?.toIntOrNull()
-                                ?: 1
-                            val episode = seasonEpisode?.groupValues?.getOrNull(2)?.toIntOrNull()
-                                ?: Regex("""(?:ح|الحلقة|episode)\s*(\d+)""", RegexOption.IGNORE_CASE)
-                                    .find(titleText)?.groupValues?.getOrNull(1)?.toIntOrNull()
-                                ?: Regex("""(?:^|\D)(\d{1,3})\s*[-|.]""")
-                                    .find(titleText)?.groupValues?.getOrNull(1)?.toIntOrNull()
-                                ?: (index + 1)
+                    val seasonItems = playDocument.select("[data-season-id]")
+                    val seasonIds = seasonItems.mapNotNull { it.attr("data-season-id").toIntOrNull() }.distinct()
+                    val allEpisodes = ArrayList<Episode>()
 
-                            newEpisode("$mainUrl/tvshow/$showId/play/$episodeId") {
-                                name = titleText.ifBlank { "الحلقة $episode" }
-                                this.season = season
-                                this.episode = episode
+                    for ((seasonIndex, seasonId) in seasonIds.withIndex()) {
+                        val seasonNumber = Regex("""\d+""")
+                            .find(seasonItems.getOrNull(seasonIndex)?.attr("data-season-number").orEmpty())
+                            ?.value?.toIntOrNull() ?: (seasonIndex + 1)
+                        val seasonJson = app.get(
+                            "$mainUrl/series/season/$seasonId?X-Requested-With=XMLHttpRequest",
+                            headers = headers + mapOf(
+                                "X-Requested-With" to "XMLHttpRequest",
+                                "Accept" to "application/json"
+                            )
+                        ).text
+                        val seasonEpisodes = JSONObject(seasonJson).optJSONArray("episodes") ?: continue
+
+                        for (episodeIndex in 0 until seasonEpisodes.length()) {
+                            val episodeObject = seasonEpisodes.optJSONObject(episodeIndex) ?: continue
+                            val episodeId = episodeObject.optString("id")
+                            if (episodeId.isBlank()) continue
+                            val episodeNumber = episodeObject.optInt("episode_number", episodeIndex + 1)
+                            val episodeTitle = episodeObject.optString("title").ifBlank {
+                                "الحلقة $episodeNumber"
                             }
+                            allEpisodes.add(newEpisode("$mainUrl/tvshow/$showId/play/$episodeId") {
+                                name = episodeTitle
+                                season = seasonNumber
+                                episode = episodeNumber
+                            })
                         }
-                        .distinctBy { it.data }
+                    }
+
+                    if (allEpisodes.isEmpty()) {
+                        allEpisodes.addAll(
+                            playDocument.select("a[href*='/play/']")
+                                .distinctBy { it.attr("href") }
+                                .mapIndexedNotNull { index, link ->
+                                    val episodeId = Regex("""/play/([^/?#]+)""")
+                                        .find(link.attr("href"))?.groupValues?.get(1)
+                                        ?: return@mapIndexedNotNull null
+                                    val titleText = link.text().trim()
+                                    newEpisode("$mainUrl/tvshow/$showId/play/$episodeId") {
+                                        name = titleText.ifBlank { "الحلقة ${index + 1}" }
+                                        episode = index + 1
+                                        season = 1
+                                    }
+                                }
+                        )
+                    }
 
                     if (allEpisodes.isNotEmpty()) {
                         episodes.clear()
