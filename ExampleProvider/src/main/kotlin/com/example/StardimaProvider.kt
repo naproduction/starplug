@@ -66,7 +66,9 @@ class StardimaProvider : MainAPI() {
 
     private fun imageUrl(image: Element): String? {
         val source = image.attr("src").ifBlank {
-            image.attr("data-src").ifBlank { image.attr("data-lazy-src") }
+            image.attr("data-src").ifBlank {
+                image.attr("data-lazy-src").ifBlank { image.attr("data-original") }
+            }
         }
         return fixUrlNull(source)
     }
