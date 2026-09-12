@@ -1,10 +1,10 @@
 [
     {
         "iconUrl": "https://upload.wikimedia.org/wikipedia/commons/2/2f/Korduene_Logo.png",
-        "fileHash": "sha256-57d93431d3907a434ec64fabe25ea2a07c2c5a6e7b6c9f9fb5497cca3add30cc",
+        "fileHash": "sha256-065f8805505bedb50e3f58b99e0207ddec79477504888792d5778eacfe2be280",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/naproduction/starplug",
-        "fileSize": 32851,
+        "fileSize": 35375,
         "status": 1,
         "language": "en",
         "authors": [
