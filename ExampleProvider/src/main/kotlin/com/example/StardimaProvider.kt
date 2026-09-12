@@ -59,9 +59,16 @@ class StardimaProvider : MainAPI() {
             if (title.isBlank() || title.contains("تسجيل الدخول")) return@mapNotNull null
 
             newAnimeSearchResponse(title, href, if (href.contains("/movie/")) TvType.Movie else TvType.Cartoon) {
-                posterUrl = fixUrlNull(image.attr("src").ifEmpty { image.attr("data-src") })
+                posterUrl = imageUrl(image)
             }
         }.distinctBy { it.url }
+    }
+
+    private fun imageUrl(image: Element): String? {
+        val source = image.attr("src").ifBlank {
+            image.attr("data-src").ifBlank { image.attr("data-lazy-src") }
+        }
+        return fixUrlNull(source)
     }
 
     private fun isContentUrl(url: String): Boolean {
@@ -80,10 +87,17 @@ class StardimaProvider : MainAPI() {
             ?: document.select("h1").map { it.text().trim() }.firstOrNull { !it.contains("تسجيل") && it.isNotBlank() }
             ?: "Cartoon"
 
-        val poster = fixUrlNull(
-            document.selectFirst("img[src*='/posters/'], img[src*='image.tmdb.org']")?.attr("src")
-                ?: document.selectFirst("meta[property=og:image]")?.attr("content")
-        )
+        // og:image belongs to this content page; selecting the first poster image
+        // globally can accidentally pick a recommendation's poster instead.
+        val poster = fixUrlNull(document.selectFirst("meta[property='og:image']")?.attr("content"))
+            ?: document.select("h1, h2").firstOrNull { it.text().trim() == title }
+                ?.parents()
+                ?.firstNotNullOfOrNull { parent ->
+                    parent.select("img").mapNotNull(::imageUrl).firstOrNull()
+                }
+            ?: document.select("img[src*='/posters/'], img[src*='image.tmdb.org']")
+                .mapNotNull(::imageUrl)
+                .firstOrNull()
 
         val description = document.selectFirst("meta[property='og:description']")?.attr("content")
             ?.takeIf { !it.contains("تسجيل الدخول") && !it.contains("One2Auth") && it.isNotBlank() }
@@ -186,16 +200,22 @@ class StardimaProvider : MainAPI() {
                 try {
                     val playDocument = app.get(firstPlayUrl, headers = headers).document
                     val allEpisodes = playDocument.select("a[href*='/play/']")
+                        .distinctBy { it.attr("href") }
                         .mapIndexedNotNull { index, link ->
                             val episodeId = Regex("""/play/([^/?#]+)""")
                                 .find(link.attr("href"))?.groupValues?.get(1)
                                 ?: return@mapIndexedNotNull null
                             val titleText = link.text().trim()
-                            val numberMatch = Regex("""S(\d+)E(\d+)""", RegexOption.IGNORE_CASE)
+                            val seasonEpisode = Regex("""S(\d+)\s*E(\d+)""", RegexOption.IGNORE_CASE)
                                 .find(titleText)
-                            val season = numberMatch?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 1
-                            val episode = numberMatch?.groupValues?.getOrNull(2)?.toIntOrNull()
-                                ?: Regex("""(?:^|\D)(\d{1,3})\s*[-|]""")
+                            val season = seasonEpisode?.groupValues?.getOrNull(1)?.toIntOrNull()
+                                ?: Regex("""(?:الموسم|season)\s*(\d+)""", RegexOption.IGNORE_CASE)
+                                    .find(titleText)?.groupValues?.getOrNull(1)?.toIntOrNull()
+                                ?: 1
+                            val episode = seasonEpisode?.groupValues?.getOrNull(2)?.toIntOrNull()
+                                ?: Regex("""(?:ح|الحلقة|episode)\s*(\d+)""", RegexOption.IGNORE_CASE)
+                                    .find(titleText)?.groupValues?.getOrNull(1)?.toIntOrNull()
+                                ?: Regex("""(?:^|\D)(\d{1,3})\s*[-|.]""")
                                     .find(titleText)?.groupValues?.getOrNull(1)?.toIntOrNull()
                                 ?: (index + 1)
 
@@ -226,11 +246,13 @@ class StardimaProvider : MainAPI() {
                 }
             newMovieLoadResponse(title, url, TvType.Movie, playUrl) {
                 this.posterUrl = poster
+                this.backgroundPosterUrl = poster
                 this.plot = description
             }
         } else {
             newTvSeriesLoadResponse(title, url, TvType.Cartoon, episodes) {
                 this.posterUrl = poster
+                this.backgroundPosterUrl = poster
                 this.plot = description
             }
         }
