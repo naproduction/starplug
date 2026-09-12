@@ -192,8 +192,8 @@ class StardimaProvider : MainAPI() {
         }
 
         // The series page only exposes the current "watch now" episode. Its
-        // player page contains the complete season list.
-        if (!url.contains("/movie/") && episodes.size <= 1) {
+        // player page is the realtime source for the complete season list.
+        if (!url.contains("/movie/")) {
             val firstPlayUrl = document.select("a[href*='/play/']")
                 .mapNotNull { fixUrlNull(it.attr("href")) }
                 .firstOrNull()
